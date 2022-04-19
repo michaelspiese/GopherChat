@@ -1,0 +1,12 @@
+REGISTER wario foobar00
+DELAY 1
+LOGIN wario foobar00
+DELAY 1
+SENDF 1mb.1.user3
+SENDF 1mb.2.user3
+SENDF 1mb.3.user3
+SENDF 1mb.4.user3
+SENDF 1mb.5.user3
+SENDF 1mb.6.user3
+SENDF 1mb.7.user3
+DELAY 9999

@@ -1,0 +1,446 @@
+//Non-blocking server
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <errno.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <sys/timeb.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <poll.h>
+#include <signal.h>
+
+typedef unsigned char BYTE;
+typedef unsigned int DWORD;
+typedef unsigned short WORD;
+
+#define MAX_REQUEST_SIZE 10000000
+#define DATA_FRAME_LEN 275
+#define MAX_CONCURRENCY_LIMIT 64
+
+typedef enum {
+	IDLE,
+	REGISTER,
+	LOGIN,
+	LOGOUT,
+	SEND,
+	SEND2,
+	SENDA,
+	SENDA2,
+	SENDF,
+	SENDF2,
+	LIST,
+	DELAY
+} msg_type;
+
+struct CONN_STAT {
+	int msg;		//0 if idle/unknown
+	int nRecv;
+	int nMsgRecv;
+	int nDataRecv;
+	int nFileRecv;
+	int nToSend;
+	int nSent;
+	int loggedIn;
+	char user[9];
+	char data[MAX_REQUEST_SIZE];
+};
+
+int nConns;	//total # of data sockets
+struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
+struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
+
+void Error(const char * format, ...) {
+	char msg[4096];
+	va_list argptr;
+	va_start(argptr, format);
+	vsprintf(msg, format, argptr);
+	va_end(argptr);
+	fprintf(stderr, "Error: %s\n", msg);
+	exit(-1);
+}
+
+void Log(const char * format, ...) {
+	char msg[2048];
+	va_list argptr;
+	va_start(argptr, format);
+	vsprintf(msg, format, argptr);
+	va_end(argptr);
+	fprintf(stderr, "%s\n", msg);
+}
+
+int Send_NonBlocking(int sockFD, const BYTE * data, int len, struct CONN_STAT * pStat, struct pollfd * pPeer) {	
+	while (pStat->nSent < len) {
+		//pStat keeps tracks of how many bytes have been sent, allowing us to "resume" 
+		//when a previously non-writable socket becomes writable. 
+		int n = send(sockFD, data + pStat->nSent, len - pStat->nSent, 0);
+		if (n >= 0) {
+			pStat->nSent += n;
+		} else if (n < 0 && (errno == ECONNRESET || errno == EPIPE)) {
+			Log("Connection closed.");
+			close(sockFD);
+			return -1;
+		} else if (n < 0 && (errno == EWOULDBLOCK)) {
+			//The socket becomes non-writable. Exit now to prevent blocking. 
+			//OS will notify us when we can write
+			pPeer->events |= POLLWRNORM; 
+			return 0; 
+		} else {
+			Error("Unexpected send error %d: %s", errno, strerror(errno));
+		}
+	}
+	pPeer->events &= ~POLLWRNORM;
+	return 0;
+}
+
+int Recv_NonBlocking(int sockFD, BYTE * data, int len, struct CONN_STAT * pStat, struct pollfd * pPeer) { // void * data?
+	//pStat keeps tracks of how many bytes have been rcvd, allowing us to "resume" 
+	//when a previously non-readable socket becomes readable. 
+	while (pStat->nRecv < len) {
+		int n = recv(sockFD, data + pStat->nRecv, len - pStat->nRecv, 0);
+		if (n > 0) {
+			pStat->nRecv += n;
+		} else if (n == 0 || (n < 0 && errno == ECONNRESET)) {
+			Log("Connection closed.");
+			close(sockFD);
+			return -1;
+		} else if (n < 0 && (errno == EWOULDBLOCK)) { 
+			//The socket becomes non-readable. Exit now to prevent blocking. 
+			//OS will notify us when we can read
+			return 0; 
+		} else {
+			Error("Unexpected recv error %d: %s.", errno, strerror(errno));
+		}
+	}
+	
+	return 0;
+}
+
+void SetNonBlockIO(int fd) {
+	int val = fcntl(fd, F_GETFL, 0);
+	if (fcntl(fd, F_SETFL, val | O_NONBLOCK) != 0) {
+		Error("Cannot set nonblocking I/O.");
+	}
+}
+
+void RemoveConnection(int i) {
+	close(peers[i].fd);	
+	if (i < nConns) {	
+		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
+		memmove(connStat + i, connStat + i + 1, (nConns-i) * sizeof(struct CONN_STAT));
+	}
+	nConns--;
+}
+
+void reg(int i) {
+	int fd = peers[i].fd;
+	
+	// receive the username and password to be registered from the client
+	if (connStat[i].nRecv < DATA_FRAME_LEN && connStat[i].nMsgRecv == sizeof(msg_type)) {
+		if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].data, DATA_FRAME_LEN, &connStat[i], &peers[i]) < 0) {
+			RemoveConnection(i);
+			return;
+		}
+					
+		if (connStat[i].nRecv == DATA_FRAME_LEN) {
+			connStat[i].nDataRecv = connStat[i].nRecv;
+			connStat[i].nRecv = 0;
+			connStat[i].nToSend = sizeof(int);
+			Log("Attempting to register account with credentials: %s", connStat[i].data);
+		}
+	}
+				
+	// parse through data frame to check if credentials are valid
+	if (connStat[i].nDataRecv == DATA_FRAME_LEN) {
+		char username[9];
+		char password[9];
+		char *line = (char *)malloc(sizeof(char) * 18);
+		size_t  len = 0;
+		memset(line, 0, 18);
+	
+		// parse for username and password
+		char *parse = strtok(connStat[i].data, " ");
+		strcpy(username, parse);
+		parse = strtok(NULL, " ");
+		strcpy(password, parse);
+		
+		// check validity of username and password
+		if ((strlen(username) > 3 && strlen(username) < 9) && (strlen(password) > 3 && strlen(password) < 9)) {
+			// open the file to append and read and check if user already exists
+			FILE *accts;
+			accts = fopen("registered_accounts.txt", "a+");
+			while(getline(&line, &len, accts) != -1) {
+				parse = strtok(line, " ");
+				if (!strcmp(parse, username)) {
+					Log("ERROR: User already exists with username %s.", username);
+					connStat[i].msg = -1;
+					
+					if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+						RemoveConnection(i);
+						return;
+					}
+					
+					return;
+				}
+			}
+			
+			fprintf(accts, "%s %s\n", username, password);
+			fclose(accts);
+		}
+		else {
+			Log("ERROR: Username/password too short/long.");
+			connStat[i].msg = -2;
+		}
+			
+		free(line);
+	
+		if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+			RemoveConnection(i);
+			return;
+		}
+	}
+}
+
+void login(int i) {
+	int fd = peers[i].fd;
+	
+	printf("test\n");
+	
+	// receive the username and password to be registered from the client
+	if (connStat[i].nRecv < DATA_FRAME_LEN && connStat[i].nMsgRecv == sizeof(msg_type)) {
+		if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].data, DATA_FRAME_LEN, &connStat[i], &peers[i]) < 0) {
+			RemoveConnection(i);
+			return;
+		}
+					
+		if (connStat[i].nRecv == DATA_FRAME_LEN) {
+			connStat[i].nDataRecv = connStat[i].nRecv;
+			connStat[i].nRecv = 0;
+			connStat[i].nToSend = sizeof(int);
+			printf("Attempting to log in to account with credentials: %s", connStat[i].data);
+		}
+	}
+		
+	// parse through data frame to check if credentials are valid
+	if (connStat[i].nDataRecv == DATA_FRAME_LEN && !connStat[i].loggedIn) {
+		char username[9];
+		char password[9];
+		char *line = (char *)malloc(sizeof(char) * 18);
+		size_t  len = 0;
+		memset(line, 0, 18);
+		
+		// parse for username and password
+		char *parse = strtok(connStat[i].data, " ");
+		strcpy(username, parse);
+		parse = strtok(NULL, " ");
+		strcpy(password, parse);
+		
+		FILE *accts;
+		accts = fopen("registered_accounts.txt", "r");
+		while(getline(&line, &len, accts) != -1) {
+			char *parse = strtok(line, " ");
+			if (!strcmp(username, parse)) {
+				char *parse = strtok(NULL, " ");
+				if (!strcmp(password, parse)) {
+					Log("User '%s' found. Logging in...", username);
+					strcpy(connStat[i].user, username);
+				 	connStat[i].loggedIn = 1;
+				}
+				else {
+					Log("Password incorrect.");
+				}
+			}
+		}
+		
+		if (!connStat[i].loggedIn) {
+			connStat[i].msg = -1;
+			Log("Unable to log in.");
+		}
+		
+		free(line);
+		fclose(accts);
+		
+		if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+			RemoveConnection(i);
+			return;
+		}
+	}
+	else if (connStat[i].nDataRecv == DATA_FRAME_LEN && connStat[i].loggedIn) {
+		Log("User '%s' already logged in. Please log out to use another account.", connStat[i].user);
+		connStat[i].msg = -2;
+		
+		if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+			RemoveConnection(i);
+			return;
+		}
+	}
+}
+
+void logout(int i) {
+	int fd = peers[i].fd;
+	
+	if (connStat[i].nMsgRecv == sizeof(msg_type)) {
+		if (connStat[i].loggedIn) {
+			Log("Logging out user '%s'. Thanks for using GopherChat!", connStat[i].user);
+			connStat[i].loggedIn = 0;
+			memset(connStat[i].user, 0, 9);
+		}
+		else {
+			Log("Cannot perform action, you are not logged in.");
+			connStat[i].msg = -1;
+		}
+		
+		if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, sizeof(int), &connStat[i], &peers[i]) < 0 || connStat[i].nSent == sizeof(int)) {
+			RemoveConnection(i);
+			return;
+		}
+	}	
+}
+
+void protocol(msg_type msg, int i) {
+	switch (msg) {
+		case REGISTER:
+			reg(i);
+			break;
+		case LOGIN:
+			login(i);
+			break;
+		case LOGOUT:
+			logout(i);
+			break;
+	}
+}
+
+void DoServer(int svrPort) {
+	BYTE * buf = (BYTE *)malloc(MAX_REQUEST_SIZE);
+	memset(buf, 0, MAX_REQUEST_SIZE);	
+	
+	int listenFD = socket(AF_INET, SOCK_STREAM, 0);
+	if (listenFD < 0) {
+		Error("Cannot create listening socket.");
+	}
+	SetNonBlockIO(listenFD);
+	
+	struct sockaddr_in serverAddr;
+	memset(&serverAddr, 0, sizeof(struct sockaddr_in));	
+	serverAddr.sin_family = AF_INET;
+	serverAddr.sin_port = htons((unsigned short) svrPort);
+	serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	int optval = 1;
+	int r = setsockopt(listenFD, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+	if (r != 0) {
+		Error("Cannot enable SO_REUSEADDR option.");
+	}
+	signal(SIGPIPE, SIG_IGN);
+
+	if (bind(listenFD, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) != 0) {
+		Error("Cannot bind to port %d.", svrPort);
+	}
+	
+	if (listen(listenFD, 16) != 0) {
+		Error("Cannot listen to port %d.", svrPort);
+	}
+	
+	nConns = 0;	
+	memset(peers, 0, sizeof(peers));	
+	peers[0].fd = listenFD;
+	peers[0].events = POLLRDNORM;	
+	memset(connStat, 0, sizeof(connStat));
+	
+	int connID = 0;
+	while (1) {	//the main loop		
+		//monitor the listening sock and data socks, nConn+1 in total
+		r = poll(peers, nConns + 1, -1);	
+		if (r < 0) {
+			Error("Invalid poll() return value.");
+			continue;
+		}			
+			
+		struct sockaddr_in clientAddr;
+		socklen_t clientAddrLen = sizeof(clientAddr);	
+		
+		//new incoming connection
+		if ((peers[0].revents & POLLRDNORM) && (nConns < MAX_CONCURRENCY_LIMIT)) {					
+			int fd = accept(listenFD, (struct sockaddr *)&clientAddr, &clientAddrLen);
+			if (fd != -1) {
+				SetNonBlockIO(fd);
+				nConns++;
+				peers[nConns].fd = fd;
+				peers[nConns].events = POLLRDNORM;
+				peers[nConns].revents = 0;
+				
+				memset(&connStat[nConns], 0, sizeof(struct CONN_STAT));
+			}
+		}
+		
+		for (int i=1; i<=nConns; i++) {
+			if (peers[i].revents & (POLLRDNORM | POLLERR | POLLHUP)) {
+				int fd = peers[i].fd;
+				
+				// protocol message type recv request
+				if (connStat[i].nMsgRecv < sizeof(msg_type)) {
+					if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].msg, sizeof(msg_type), &connStat[i], &peers[i]) < 0) {
+						RemoveConnection(i);
+						continue;
+					}
+					
+					if (connStat[i].nRecv == sizeof(msg_type)) {
+						connStat[i].nMsgRecv = connStat[i].nRecv;
+						connStat[i].nRecv = 0;
+						msg_type msg = connStat[i].msg;
+						if (msg < 1 || msg > 11)
+							Error("Unknown message type: %d", msg);
+						Log("Message from connection %d: %d", ++connID, msg);
+					}
+				}
+				
+				// act on message received
+				protocol(connStat[i].msg, i);
+			}
+			
+			//a previously blocked data socket becomes writable
+			if (peers[i].revents & POLLWRNORM) {
+				//int msg = connStat[i].msg;
+				if (Send_NonBlocking(peers[i].fd, connStat[i].data, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+					RemoveConnection(i);
+					continue;
+				}
+			}
+
+		}
+	}	
+}
+
+int main(int argc, char * * argv) {	
+	if (argc != 2) {
+		Log("Usage: %s [server Port]/['reset']", argv[0]);
+		return -1;
+	}
+	
+	int port = atoi(argv[1]);
+	if (!strcmp(argv[1], "reset")) {
+		if (remove("registered_accounts.txt") == 0) {
+			Log("Resetting database.");
+			return 0;
+		}
+		else {
+			Log("Unable to delete account database. Is the file already deleted?");
+			return -1;
+		}
+	}
+	else if(port == 0) {
+		Log("Usage: %s [server Port]/['reset']", argv[0]);
+		return -1;
+	}
+	
+	// perform server actions on specified port
+	DoServer(port);
+	
+	// this should never be reached
+	return 0;
+}

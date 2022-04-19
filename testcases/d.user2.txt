@@ -1,0 +1,4 @@
+REGISTER luigi foobar00
+DELAY 1
+LOGIN luigi foobar00
+DELAY 9999
