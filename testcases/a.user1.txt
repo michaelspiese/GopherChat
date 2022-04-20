@@ -1,0 +1,4 @@
+REGISTER mario foobar00
+DELAY 1
+LOGIN mario foobar00
+DELAY 9999

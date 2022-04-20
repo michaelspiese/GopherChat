@@ -1,0 +1,3 @@
+REGISTER test4 test4
+LOGIN test4 test4
+DELAY 1

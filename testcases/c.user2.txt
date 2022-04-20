@@ -1,0 +1,6 @@
+REGISTER luigi foobar00
+DELAY 1
+LOGIN luigi foobar00
+DELAY 1
+SENDF2 mario 1kb.user2
+DELAY 9999
