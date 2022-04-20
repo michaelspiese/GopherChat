@@ -68,19 +68,14 @@ msg_type strToMsg (char *msg) {
 struct CONN_STAT {
 	int msg;		//0 if idle/unknown
 	int nRecv;
-	int nMsgRecv;
-	int nDataRecv;
-	int nFileRecv;
 	int nToSend;
 	int nSent;
-	int loggedIn;
-	char user[9];
 	char data[MAX_REQUEST_SIZE];
 };
 
 int nConns;
-struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
-struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
+struct pollfd *peer;	//sockets to be monitored by poll()
+struct CONN_STAT connStat;	//app-layer stats of the sockets
 
 void Error(const char * format, ...) {
 	char msg[4096];
@@ -99,6 +94,25 @@ void Log(const char * format, ...) {
 	vsprintf(msg, format, argptr);
 	va_end(argptr);
 	fprintf(stderr, "%s\n", msg);
+}
+
+msg_type cmdToMsg (char *str) {
+	msg_type msg;
+
+	char *split = strchr(str, ' ');
+	if (split != NULL)
+		*split = '\0';
+	
+	// Convert the command string to its corresponding enumerated value
+	if ((msg = strToMsg(str)) == -1) {
+		Log("ERROR: Unknown message %d", msg);
+		return -1;
+	}
+	
+	if (split != NULL)
+		*split = ' ';
+	
+	return msg;
 }
 
 int Send_NonBlocking(int sockFD, const BYTE * data, int len, struct CONN_STAT * pStat, struct pollfd * pPeer) {	
@@ -155,14 +169,14 @@ void SetNonBlockIO(int fd) {
 	}
 }
 
-void RemoveConnection(int i) {
-	close(peers[i].fd);	
-	if (i < nConns) {	
-		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
-		memmove(connStat + i, connStat + i + 1, (nConns-i) * sizeof(struct CONN_STAT));
-	}
-	nConns--;
-}
+//void RemoveConnection(int i) {
+//	close(peers[i].fd);	
+//	if (i < nConns) {	
+//		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
+//		memmove(connStat + i, connStat + i + 1, (nConns-i) * sizeof(struct CONN_STAT));
+//	}
+//	nConns--;
+//}
 
 int reg(int sock, char *buf) {
 	int returnMsg;
@@ -203,8 +217,7 @@ int main(int argc, char *argv[]) {
 	char *command = (char *)malloc(sizeof(char) * CMD_LEN);
 	int n;
 	
-	// command line arguments must follow form detailed in project outline:
-	/* !! ./client [Server IP Address] [Server Port] [Input Script] !! */
+	// command line arguments must follow form detailed in project outline
 	if (argc < 4) {
 		Error("Incorrect number of arguments. Proper usage: './client [Server IP Address] [Server Port] [Input Script]'");
 	}
@@ -222,16 +235,16 @@ int main(int argc, char *argv[]) {
 	
 	// Create the socket that will receive messages
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
-	//SetNonBlockIO(recvSock);
+	//SetNonBlockIO(sock);
 	if (connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr)) > 0) {	
 		
 	}
 
 	nConns = 0;	
-	memset(peers, 0, sizeof(peers));	
-	peers[0].fd = sock;
-	peers[0].events = POLLRDNORM;	
-	memset(connStat, 0, sizeof(connStat));
+	peer = malloc(sizeof(struct pollfd));
+	memset(peer, 0, sizeof(struct pollfd));
+	memset(&connStat, 0, sizeof(struct CONN_STAT));
+	peer->events = POLLRDNORM | POLLWRNORM;
 	
 	// Open the input script
 	FILE * input;
@@ -241,22 +254,59 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 	
-	//while(1) {
-		//r = poll(peers, nConns + 1, -1);	
-		//if (r < 0) {
-		//	Error("Invalid poll() return value.");
-		//	continue;
-		//}	
-	//}
+	memset(command, 0, CMD_LEN);
+	if(getline(&line, &len, input) == -1) {
+		Log("initial getline failed");
+		return -1;
+	}
+	sprintf(command, "%s", line);
+	connStat.msg = cmdToMsg(command);
+	printf("%d\n", connStat.msg);
 	
-	while (getline(&line, &len, input) != -1) {
-		// Clear data buffer before each command
-		memset(command, 0, CMD_LEN);
+	while(1) {
+		int r = poll(peer, 1, -1);	
+		if (r < 0) {
+			Error("Invalid poll() return value.");
+			continue;
+		}			
 		
-		sprintf(command, "%s", line);
-		n = send(sock, command, CMD_LEN, 0);
+		// Recv request
+		if (peer->revents & (POLLRDNORM | POLLERR | POLLHUP)) {
+			if ((Recv_NonBlocking(sock, connStat.data, CMD_LEN, &connStat, peer) < 0) || connStat.nRecv == CMD_LEN) {
+				connStat.nRecv = 0;
+				Log("%s", connStat.data);
+				continue;
+			}
+		}
 		
-		//n = recv(sock, command, CMD_LEN, 0);
+		// Send request
+		if (peer->revents & POLLWRNORM) {
+			if (connStat.nSent < CMD_LEN) {
+				if (Send_NonBlocking(sock, command, CMD_LEN, &connStat, peer) < 0) {
+					Error("command sent incorrectly");
+				}
+				
+				if (connStat.nSent == CMD_LEN) {
+					peer->events |= POLLWRNORM;
+					connStat.nSent = 0;				
+					if ((Recv_NonBlocking(sock, connStat.data, CMD_LEN, &connStat, peer) < 0) || connStat.nRecv == CMD_LEN) {
+						connStat.nRecv = 0;
+						Log("%s", connStat.data);
+					}
+					memset(command, 0, CMD_LEN);
+					if(getline(&line, &len, input) == -1) {
+						Log("EOF");
+						break;
+					}
+					sprintf(command, "%s", line);
+					connStat.msg = cmdToMsg(command);
+					printf("%d\n", connStat.msg);
+				}
+			}
+		
+		}
+		
+
 	}
 	
 	// Close the input file after end of file

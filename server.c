@@ -201,12 +201,22 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	fclose(accts);
 	free(line);
 	
-	sprintf(stat->dataSend, "User '%s' registered successfully.\n", username);
+	sprintf(stat->dataSend, "User '%s' registered successfully.", username);
 	
 	stat->nCmdRecv = 0;
 	
 	stat->nToSend = CMD_LEN;
 	if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
+		stat->nSent = 0;
+		stat->nToSend = 0;
+		return;
+	}
+}
+
+void tempSend(struct CONN_STAT * stat, int i, char * str) {
+	sprintf(stat->dataSend, "%s", str);
+	stat->nToSend = CMD_LEN;
+	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
 		stat->nSent = 0;
 		stat->nToSend = 0;
 		return;
@@ -220,42 +230,51 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			break;
 		case LOGIN:
 			//login(stat, i);
+			tempSend(stat, i, "login");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case LOGOUT:
 			//logout(stat, i);
+			tempSend(stat, i, "logout");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SEND:
 			//msg(0, stat, i);
+			tempSend(stat, i, "send");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SEND2:
 			//msg(1, stat, i);
+			tempSend(stat, i, "send2");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDA:
 			//msg(2, stat, i);
+			tempSend(stat, i, "senda");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDA2:
 			//msg(3, stat, i);
+			tempSend(stat, i, "senda2");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDF:
 			//sendfile(0, stat, i);
+			tempSend(stat, i, "sendf");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDF2:
 			//sendfile(1, stat, i);
+			tempSend(stat, i, "sendf2");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case LIST:
 			//list();
+			tempSend(stat, i, "list");
 			connStat[i].nCmdRecv = 0;
 			break;
-		case DELAY:
-			Log("delay");
+		case DELAY:	
+			tempSend(stat, i, "delay");
 			connStat[i].nCmdRecv = 0;
 			
 	}
@@ -350,7 +369,8 @@ void DoServer(int svrPort) {
 		
 						// Convert the command string to its corresponding enumerated value
 						if ((connStat[i].msg = strToMsg(connStat[i].dataRecv)) == -1) {
-							Log("ERROR: Unknown message");
+							Log("ERROR: Unknown message %d", connStat[i].msg);
+							continue;
 						}
 					}
 				}
