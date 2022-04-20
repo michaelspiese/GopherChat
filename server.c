@@ -136,185 +136,6 @@ void RemoveConnection(int i) {
 	nConns--;
 }
 
-void reg(int i) {
-	int fd = peers[i].fd;
-	
-	// receive the username and password to be registered from the client
-	if (connStat[i].nRecv < DATA_FRAME_LEN && connStat[i].nMsgRecv == sizeof(msg_type)) {
-		if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].data, DATA_FRAME_LEN, &connStat[i], &peers[i]) < 0) {
-			RemoveConnection(i);
-			return;
-		}
-					
-		if (connStat[i].nRecv == DATA_FRAME_LEN) {
-			connStat[i].nDataRecv = connStat[i].nRecv;
-			connStat[i].nRecv = 0;
-			connStat[i].nToSend = sizeof(int);
-			Log("Attempting to register account with credentials: %s", connStat[i].data);
-		}
-	}
-				
-	// parse through data frame to check if credentials are valid
-	if (connStat[i].nDataRecv == DATA_FRAME_LEN) {
-		char username[9];
-		char password[9];
-		char *line = (char *)malloc(sizeof(char) * 18);
-		size_t  len = 0;
-		memset(line, 0, 18);
-	
-		// parse for username and password
-		char *parse = strtok(connStat[i].data, " ");
-		strcpy(username, parse);
-		parse = strtok(NULL, " ");
-		strcpy(password, parse);
-		
-		// check validity of username and password
-		if ((strlen(username) > 3 && strlen(username) < 9) && (strlen(password) > 3 && strlen(password) < 9)) {
-			// open the file to append and read and check if user already exists
-			FILE *accts;
-			accts = fopen("registered_accounts.txt", "a+");
-			while(getline(&line, &len, accts) != -1) {
-				parse = strtok(line, " ");
-				if (!strcmp(parse, username)) {
-					Log("ERROR: User already exists with username %s.", username);
-					connStat[i].msg = -1;
-					
-					if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
-						RemoveConnection(i);
-						return;
-					}
-					
-					return;
-				}
-			}
-			
-			fprintf(accts, "%s %s\n", username, password);
-			fclose(accts);
-		}
-		else {
-			Log("ERROR: Username/password too short/long.");
-			connStat[i].msg = -2;
-		}
-			
-		free(line);
-	
-		if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
-			RemoveConnection(i);
-			return;
-		}
-	}
-}
-
-void login(int i) {
-	int fd = peers[i].fd;
-	
-	printf("test\n");
-	
-	// receive the username and password to be registered from the client
-	if (connStat[i].nRecv < DATA_FRAME_LEN && connStat[i].nMsgRecv == sizeof(msg_type)) {
-		if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].data, DATA_FRAME_LEN, &connStat[i], &peers[i]) < 0) {
-			RemoveConnection(i);
-			return;
-		}
-					
-		if (connStat[i].nRecv == DATA_FRAME_LEN) {
-			connStat[i].nDataRecv = connStat[i].nRecv;
-			connStat[i].nRecv = 0;
-			connStat[i].nToSend = sizeof(int);
-			printf("Attempting to log in to account with credentials: %s", connStat[i].data);
-		}
-	}
-		
-	// parse through data frame to check if credentials are valid
-	if (connStat[i].nDataRecv == DATA_FRAME_LEN && !connStat[i].loggedIn) {
-		char username[9];
-		char password[9];
-		char *line = (char *)malloc(sizeof(char) * 18);
-		size_t  len = 0;
-		memset(line, 0, 18);
-		
-		// parse for username and password
-		char *parse = strtok(connStat[i].data, " ");
-		strcpy(username, parse);
-		parse = strtok(NULL, " ");
-		strcpy(password, parse);
-		
-		FILE *accts;
-		accts = fopen("registered_accounts.txt", "r");
-		while(getline(&line, &len, accts) != -1) {
-			char *parse = strtok(line, " ");
-			if (!strcmp(username, parse)) {
-				char *parse = strtok(NULL, " ");
-				if (!strcmp(password, parse)) {
-					Log("User '%s' found. Logging in...", username);
-					strcpy(connStat[i].user, username);
-				 	connStat[i].loggedIn = 1;
-				}
-				else {
-					Log("Password incorrect.");
-				}
-			}
-		}
-		
-		if (!connStat[i].loggedIn) {
-			connStat[i].msg = -1;
-			Log("Unable to log in.");
-		}
-		
-		free(line);
-		fclose(accts);
-		
-		if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
-			RemoveConnection(i);
-			return;
-		}
-	}
-	else if (connStat[i].nDataRecv == DATA_FRAME_LEN && connStat[i].loggedIn) {
-		Log("User '%s' already logged in. Please log out to use another account.", connStat[i].user);
-		connStat[i].msg = -2;
-		
-		if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
-			RemoveConnection(i);
-			return;
-		}
-	}
-}
-
-void logout(int i) {
-	int fd = peers[i].fd;
-	
-	if (connStat[i].nMsgRecv == sizeof(msg_type)) {
-		if (connStat[i].loggedIn) {
-			Log("Logging out user '%s'. Thanks for using GopherChat!", connStat[i].user);
-			connStat[i].loggedIn = 0;
-			memset(connStat[i].user, 0, 9);
-		}
-		else {
-			Log("Cannot perform action, you are not logged in.");
-			connStat[i].msg = -1;
-		}
-		
-		if (Send_NonBlocking(fd, (BYTE *)&connStat[i].msg, sizeof(int), &connStat[i], &peers[i]) < 0 || connStat[i].nSent == sizeof(int)) {
-			RemoveConnection(i);
-			return;
-		}
-	}	
-}
-
-void protocol(msg_type msg, int i) {
-	switch (msg) {
-		case REGISTER:
-			reg(i);
-			break;
-		case LOGIN:
-			login(i);
-			break;
-		case LOGOUT:
-			logout(i);
-			break;
-	}
-}
-
 void DoServer(int svrPort) {
 	BYTE * buf = (BYTE *)malloc(MAX_REQUEST_SIZE);
 	memset(buf, 0, MAX_REQUEST_SIZE);	
@@ -383,30 +204,34 @@ void DoServer(int svrPort) {
 				int fd = peers[i].fd;
 				
 				// protocol message type recv request
-				if (connStat[i].nMsgRecv < sizeof(msg_type)) {
-					if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].msg, sizeof(msg_type), &connStat[i], &peers[i]) < 0) {
+				if (connStat[i].nRecv < DATA_FRAME_LEN) {
+					if (Recv_NonBlocking(fd, connStat[i].data, DATA_FRAME_LEN, &connStat[i], &peers[i]) < 0) {
 						RemoveConnection(i);
 						continue;
 					}
 					
-					if (connStat[i].nRecv == sizeof(msg_type)) {
-						connStat[i].nMsgRecv = connStat[i].nRecv;
-						connStat[i].nRecv = 0;
-						msg_type msg = connStat[i].msg;
-						if (msg < 1 || msg > 11)
-							Error("Unknown message type: %d", msg);
-						Log("Message from connection %d: %d", ++connID, msg);
+					if (connStat[i].nRecv == DATA_FRAME_LEN) {
+						Log("%d bytes received", connStat[i].nRecv);
+						connStat[i].nToSend = DATA_FRAME_LEN;
+						printf("%s", connStat[i].data);
 					}
 				}
 				
-				// act on message received
-				protocol(connStat[i].msg, i);
+				if (connStat[i].nToSend != 0) {
+					if (Send_NonBlocking(peers[i].fd, connStat[i].data, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+						Log("Disconnecting");
+						RemoveConnection(i);
+						continue;
+					}
+				}
+				
 			}
 			
 			//a previously blocked data socket becomes writable
 			if (peers[i].revents & POLLWRNORM) {
 				//int msg = connStat[i].msg;
 				if (Send_NonBlocking(peers[i].fd, connStat[i].data, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+					Log("Disconnecting");
 					RemoveConnection(i);
 					continue;
 				}

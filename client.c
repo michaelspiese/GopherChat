@@ -1,12 +1,25 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <sys/timeb.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #include <poll.h>
+#include <signal.h>
 
 #define MAX_REQUEST_SIZE 10000000
 #define MAX_DATA_FRAME 275
+#define MAX_CONCURRENCY_LIMIT 8
+
+typedef unsigned char BYTE;
+typedef unsigned int DWORD;
+typedef unsigned short WORD;
 
 // protocol messages
 typedef enum {
@@ -23,6 +36,23 @@ typedef enum {
 	LIST,
 	DELAY
 } msg_type;
+
+struct CONN_STAT {
+	int msg;		//0 if idle/unknown
+	int nRecv;
+	int nMsgRecv;
+	int nDataRecv;
+	int nFileRecv;
+	int nToSend;
+	int nSent;
+	int loggedIn;
+	char user[9];
+	char data[MAX_REQUEST_SIZE];
+};
+
+int nConns;	//total # of data sockets
+struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
+struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
 
 // converting string (from script) to enumerated protocol message
 msg_type strToMsg (char *msg) {
@@ -50,6 +80,88 @@ msg_type strToMsg (char *msg) {
 		return DELAY;
 	else
 		return -1;
+}
+
+void Error(const char * format, ...) {
+	char msg[4096];
+	va_list argptr;
+	va_start(argptr, format);
+	vsprintf(msg, format, argptr);
+	va_end(argptr);
+	fprintf(stderr, "Error: %s\n", msg);
+	exit(-1);
+}
+
+void Log(const char * format, ...) {
+	char msg[2048];
+	va_list argptr;
+	va_start(argptr, format);
+	vsprintf(msg, format, argptr);
+	va_end(argptr);
+	fprintf(stderr, "%s\n", msg);
+}
+
+int Send_NonBlocking(int sockFD, const BYTE * data, int len, struct CONN_STAT * pStat, struct pollfd * pPeer) {	
+	while (pStat->nSent < len) {
+		//pStat keeps tracks of how many bytes have been sent, allowing us to "resume" 
+		//when a previously non-writable socket becomes writable. 
+		int n = send(sockFD, data + pStat->nSent, len - pStat->nSent, 0);
+		if (n >= 0) {
+			pStat->nSent += n;
+		} else if (n < 0 && (errno == ECONNRESET || errno == EPIPE)) {
+			Log("Connection closed.");
+			close(sockFD);
+			return -1;
+		} else if (n < 0 && (errno == EWOULDBLOCK)) {
+			//The socket becomes non-writable. Exit now to prevent blocking. 
+			//OS will notify us when we can write
+			pPeer->events |= POLLWRNORM; 
+			return 0; 
+		} else {
+			Error("Unexpected send error %d: %s", errno, strerror(errno));
+		}
+	}
+	pPeer->events &= ~POLLWRNORM;
+	return 0;
+}
+
+int Recv_NonBlocking(int sockFD, BYTE * data, int len, struct CONN_STAT * pStat, struct pollfd * pPeer) { // void * data?
+	//pStat keeps tracks of how many bytes have been rcvd, allowing us to "resume" 
+	//when a previously non-readable socket becomes readable. 
+	while (pStat->nRecv < len) {
+		int n = recv(sockFD, data + pStat->nRecv, len - pStat->nRecv, 0);
+		if (n > 0) {
+			pStat->nRecv += n;
+		} else if (n == 0 || (n < 0 && errno == ECONNRESET)) {
+			Log("Connection closed.");
+			close(sockFD);
+			return -1;
+		} else if (n < 0 && (errno == EWOULDBLOCK)) { 
+			//The socket becomes non-readable. Exit now to prevent blocking. 
+			//OS will notify us when we can read
+			return 0; 
+		} else {
+			Error("Unexpected recv error %d: %s.", errno, strerror(errno));
+		}
+	}
+	
+	return 0;
+}
+
+void SetNonBlockIO(int fd) {
+	int val = fcntl(fd, F_GETFL, 0);
+	if (fcntl(fd, F_SETFL, val | O_NONBLOCK) != 0) {
+		Error("Cannot set nonblocking I/O.");
+	}
+}
+
+void RemoveConnection(int i) {
+	close(peers[i].fd);	
+	if (i < nConns) {	
+		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
+		memmove(connStat + i, connStat + i + 1, (nConns-i) * sizeof(struct CONN_STAT));
+	}
+	nConns--;
 }
 
 int reg(int sock, char *buf) {
@@ -103,6 +215,10 @@ int main(int argc, char *argv[]) {
 	// grab port
 	port = atoi(argv[2]);
 
+	int recvSock = socket(AF_INET, SOCK_STREAM, 0);
+
+	SetNonBlockIO(recvSock);
+
 	//Set the destination IP address and port number
 	struct sockaddr_in serverAddr;
 	memset(&serverAddr, 0, sizeof(serverAddr));
@@ -110,16 +226,30 @@ int main(int argc, char *argv[]) {
 	serverAddr.sin_port = htons((unsigned short) port);
 	inet_pton(AF_INET, argv[1], &serverAddr.sin_addr);
 	
+	//Create the socket that will receive messages
+	if (connect(recvSock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr)) > 0) {	
+		
+	}
+
+	nConns = 0;	
+	memset(peers, 0, sizeof(peers));	
+	peers[0].fd = recvSock;
+	peers[0].events = POLLRDNORM;	
+	memset(connStat, 0, sizeof(connStat));
+	
 	if((filename = fopen(argv[3], "r")) == NULL) {
 		printf("Unable to open file '%s'.\n", argv[3]);
 		return -1;
 	}
-		
-	//Create the socket, connect to the server
-	int sock = socket(AF_INET, SOCK_STREAM, 0);	
-	connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
 	
 	while (getline(&line, &len, filename) != -1) {
+		//Create a socket to send a command to the server
+		printf("%s", line);
+		
+		int sock = socket(AF_INET, SOCK_STREAM, 0);	
+		
+		connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
+	
 		memset(buf, 0, MAX_REQUEST_SIZE);
 		
 		char * const split = strchr(line, ' ');
@@ -129,7 +259,7 @@ int main(int argc, char *argv[]) {
 		else {
 			printf("invalid\n");
 			continue;
-		}	
+		}
 		
 		msg_type msg = strToMsg(line);
 		if (msg == -1) {
@@ -138,75 +268,24 @@ int main(int argc, char *argv[]) {
 			return -1;
 		}
 		
-		strcpy(buf, split+1);
-		printf("%d %s", msg, buf);
+		sprintf(buf, "%d %s", (int) msg, split+1);
+		n = send(sock, buf, MAX_DATA_FRAME, 0);
 		
-		switch(msg) {
-			case REGISTER:
-				// make sure that the number of arguments is correct, otherwise return
-				//if (argc != 4) {
-				//	printf("Incorrect number of arguments. Got %d, expected 4.\n", argc);
-				//	//return -1;
-				//}
-				
-				// if command is of valid form, send message type to server
-				n = send(sock, &msg, sizeof(msg_type), 0);
-			
-				// use register protocol to send data to server
-				if ((n = reg(sock, buf)) == REGISTER) {
-					printf("User registered successfully.\n");
-				}
-				else if (n == -1) {
-					printf("User already exists. Please choose new username.\n");
-				}
-				else {
-					printf("Username/password invalid size (4-8 characters). Please choose new credentials.\n");
-				}
-				break;
-			case LOGIN:
-				// make sure that the number of arguments is correct, otherwise return
-				//if (argc != 4) {
-				//	printf("Incorrect number of arguments. Got %d, expected 4.\n");
-				//	//return -1;
-				//}
-				
-				// if command is of valid form, send message type to server
-				n = send(sock, &msg, sizeof(msg_type), 0);
-				
-				if ((n = login(sock, buf)) == LOGIN) {
-					printf("Successfully logged in user '%s'.\n", argv[2]);
-				}
-				else {
-					printf("Unable to log in. Please check credentials and retry.\n");
-				}
-				break;
-			case LOGOUT:
-				// make sure that the number of arguments is correct, otherwise return
-				//if (argc != 2) {
-				//	printf("Incorrect number of arguments. Got %d, expected 2.\n", argc);
-				//	//return -1;
-				//}	
-				
-				// if command is of valid form, send message type to server
-				n = send(sock, &msg, sizeof(msg_type), 0);
-							
-				if ((n = logout(sock)) == LOGOUT) {
-					printf("Successfully logged out.\n");
-				}
-				else {
-					printf("Cannot log out, you are not logged in.\n");
-				}
-				break;
-			case DELAY:
-				printf("delay\n");
-		}
+		n = recv(sock, buf, MAX_DATA_FRAME, 0);
+		
+		printf("%s", buf);
+		
+		close(sock);
+		
 	}
+	
+	//n = send(recvSock, buf, MAX_DATA_FRAME, 0);
 	
 	free(buf);
 	free(line);
 
 	//Close socket
-	close(sock);
+	close(recvSock);
 	return 0;
 }
 
