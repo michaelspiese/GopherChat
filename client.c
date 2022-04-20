@@ -14,7 +14,7 @@
 #include <signal.h>
 
 #define MAX_REQUEST_SIZE 10000000
-#define MAX_DATA_FRAME 275
+#define CMD_LEN 275
 #define MAX_CONCURRENCY_LIMIT 8
 
 typedef unsigned char BYTE;
@@ -36,23 +36,6 @@ typedef enum {
 	LIST,
 	DELAY
 } msg_type;
-
-struct CONN_STAT {
-	int msg;		//0 if idle/unknown
-	int nRecv;
-	int nMsgRecv;
-	int nDataRecv;
-	int nFileRecv;
-	int nToSend;
-	int nSent;
-	int loggedIn;
-	char user[9];
-	char data[MAX_REQUEST_SIZE];
-};
-
-int nConns;	//total # of data sockets
-struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
-struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
 
 // converting string (from script) to enumerated protocol message
 msg_type strToMsg (char *msg) {
@@ -81,6 +64,23 @@ msg_type strToMsg (char *msg) {
 	else
 		return -1;
 }
+
+struct CONN_STAT {
+	int msg;		//0 if idle/unknown
+	int nRecv;
+	int nMsgRecv;
+	int nDataRecv;
+	int nFileRecv;
+	int nToSend;
+	int nSent;
+	int loggedIn;
+	char user[9];
+	char data[MAX_REQUEST_SIZE];
+};
+
+int nConns;
+struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
+struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
 
 void Error(const char * format, ...) {
 	char msg[4096];
@@ -199,25 +199,19 @@ int logout(int sock) {
 }
 
 int main(int argc, char *argv[]) {
-	char *line = (char *)malloc(sizeof(char) * MAX_DATA_FRAME);
-	char *buf = (char *)malloc(sizeof(char) * MAX_REQUEST_SIZE);
-	FILE * filename;
-	size_t len = 0;
-	int port;
+	char *line = (char *)malloc(sizeof(char) * CMD_LEN);
+	char *command = (char *)malloc(sizeof(char) * CMD_LEN);
 	int n;
 	
-	// command line arguments must follow form detailed in project outline
-	if (argc < 4)
-		return -1;
-		
-	memset(line, 0, MAX_DATA_FRAME);
+	// command line arguments must follow form detailed in project outline:
+	/* !! ./client [Server IP Address] [Server Port] [Input Script] !! */
+	if (argc < 4) {
+		Error("Incorrect number of arguments. Proper usage: './client [Server IP Address] [Server Port] [Input Script]'");
+	}
+	memset(line, 0, CMD_LEN);
 	
-	// grab port
-	port = atoi(argv[2]);
-
-	int sock = socket(AF_INET, SOCK_STREAM, 0);
-
-	//SetNonBlockIO(recvSock);
+	// grab port from command line
+	int port = atoi(argv[2]);
 
 	//Set the destination IP address and port number
 	struct sockaddr_in serverAddr;
@@ -226,7 +220,9 @@ int main(int argc, char *argv[]) {
 	serverAddr.sin_port = htons((unsigned short) port);
 	inet_pton(AF_INET, argv[1], &serverAddr.sin_addr);
 	
-	//Create the socket that will receive messages
+	// Create the socket that will receive messages
+	int sock = socket(AF_INET, SOCK_STREAM, 0);
+	//SetNonBlockIO(recvSock);
 	if (connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr)) > 0) {	
 		
 	}
@@ -237,51 +233,39 @@ int main(int argc, char *argv[]) {
 	peers[0].events = POLLRDNORM;	
 	memset(connStat, 0, sizeof(connStat));
 	
-	if((filename = fopen(argv[3], "r")) == NULL) {
+	// Open the input script
+	FILE * input;
+	size_t len = 0;
+	if((input = fopen(argv[3], "r")) == NULL) {
 		printf("Unable to open file '%s'.\n", argv[3]);
 		return -1;
 	}
 	
-	while (getline(&line, &len, filename) != -1) {
-		//Create a socket to send a command to the server
-		printf("%s", line);
-		
-		//int sock = socket(AF_INET, SOCK_STREAM, 0);	
-		
-		//connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
+	//while(1) {
+		//r = poll(peers, nConns + 1, -1);	
+		//if (r < 0) {
+		//	Error("Invalid poll() return value.");
+		//	continue;
+		//}	
+	//}
 	
-		memset(buf, 0, MAX_REQUEST_SIZE);
+	while (getline(&line, &len, input) != -1) {
+		// Clear data buffer before each command
+		memset(command, 0, CMD_LEN);
 		
-		char * const split = strchr(line, ' ');
-		if (split != NULL) {
-			*split = '\0';
-		}
-		else {
-			printf("invalid\n");
-			continue;
-		}
+		sprintf(command, "%s", line);
+		n = send(sock, command, CMD_LEN, 0);
 		
-		msg_type msg = strToMsg(line);
-		if (msg == -1) {
-			printf("ERROR: Unknown message\n");
-			close(sock);
-			return -1;
-		}
-		
-		n = send(sock, &msg, sizeof(msg_type), 0);
-		
-		sprintf(buf, "%s", split+1);
-		n = send(sock, buf, MAX_DATA_FRAME, 0);
-		
-		n = recv(sock, buf, MAX_DATA_FRAME, 0);
-		
-		printf("%s", buf);
-		
-		//close(sock);
-		
+		//n = recv(sock, command, CMD_LEN, 0);
 	}
 	
-	free(buf);
+	// Close the input file after end of file
+	if (fclose(input) < 0) {
+		Error("Attempt to close input script failed.");
+	}
+	
+	// After execution, allocated memory can be freed
+	free(command);
 	free(line);
 
 	//Close socket

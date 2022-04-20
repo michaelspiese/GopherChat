@@ -19,7 +19,7 @@ typedef unsigned int DWORD;
 typedef unsigned short WORD;
 
 #define MAX_REQUEST_SIZE 10000000
-#define DATA_FRAME_LEN 275
+#define CMD_LEN 275
 #define MAX_CONCURRENCY_LIMIT 64
 
 typedef enum {
@@ -37,15 +37,44 @@ typedef enum {
 	DELAY
 } msg_type;
 
+// converting string (from script) to enumerated protocol message
+msg_type strToMsg (char *msg) {
+	if (!strcmp(msg, "REGISTER"))
+		return REGISTER;
+	else if (!strcmp(msg, "LOGIN"))
+		return LOGIN;
+	else if (!strcmp(msg, "LOGOUT"))
+		return LOGOUT;
+	else if (!strcmp(msg, "SEND"))
+		return SEND;
+	else if (!strcmp(msg, "SEND2"))
+		return SEND2;
+	else if (!strcmp(msg, "SENDA"))
+		return SENDA;
+	else if (!strcmp(msg, "SENDA2"))
+		return SENDA2;
+	else if (!strcmp(msg, "SENDF"))
+		return SENDF;
+	else if (!strcmp(msg, "SENDF2"))
+		return SENDF2;
+	else if (!strcmp(msg, "LIST"))
+		return LIST;
+	else if (!strcmp(msg, "DELAY"))
+		return DELAY;
+	else
+		return -1;
+}
+
 struct CONN_STAT {
 	int msg;		//0 if idle/unknown
 	int nRecv;
-	int nToRecv;
-	int nMsgRecv;
+	int nCmdRecv;
 	int nDataRecv;
-	int nToSend;
+	int nToRecv;
 	int nSent;
-	char data[MAX_REQUEST_SIZE];
+	int nToSend;
+	char dataRecv[CMD_LEN];
+	char dataSend[CMD_LEN];
 };
 
 int nConns;	//total # of data sockets
@@ -134,6 +163,104 @@ void RemoveConnection(int i) {
 	nConns--;
 }
 
+void reg(struct CONN_STAT * stat, int i, char * credentials) {
+	int fd = peers[i].fd;
+	char *line = (char *)malloc(sizeof(char) * 18);
+	size_t len;
+	char username[9];
+	char password[9];
+			
+	// parse for username and password
+	char *parse = strtok(credentials, " ");
+	sprintf(username, "%s", parse);
+	parse = strtok(NULL, " ");
+	sprintf(password, "%s", parse);
+	
+	FILE *accts;
+	accts = fopen("registered_accounts.txt", "a+");
+	while(getline(&line, &len, accts) != -1) {
+		parse = strtok(line, " ");
+		if (!strcmp(parse, username)) {
+			sprintf(stat->dataSend, "ERROR: User already exists with username '%s'. Please choose a new username.", username);
+			Log("%s", stat->dataSend);
+			
+			stat->nCmdRecv = 0;
+					
+			stat->nToSend = CMD_LEN;
+			if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
+				stat->nSent = 0;
+				stat->nToSend = 0;
+				return;
+			}
+			
+			return;
+		}
+	}
+	
+	fprintf(accts, "%s %s", username, password);
+	fclose(accts);
+	free(line);
+	
+	sprintf(stat->dataSend, "User '%s' registered successfully.\n", username);
+	
+	stat->nCmdRecv = 0;
+	
+	stat->nToSend = CMD_LEN;
+	if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
+		stat->nSent = 0;
+		stat->nToSend = 0;
+		return;
+	}
+}
+
+void protocol (struct CONN_STAT * stat, int i, char * body) {
+	switch (stat->msg) {
+		case REGISTER:
+			reg(stat, i, body+1);
+			break;
+		case LOGIN:
+			//login(stat, i);
+			connStat[i].nCmdRecv = 0;
+			break;
+		case LOGOUT:
+			//logout(stat, i);
+			connStat[i].nCmdRecv = 0;
+			break;
+		case SEND:
+			//msg(0, stat, i);
+			connStat[i].nCmdRecv = 0;
+			break;
+		case SEND2:
+			//msg(1, stat, i);
+			connStat[i].nCmdRecv = 0;
+			break;
+		case SENDA:
+			//msg(2, stat, i);
+			connStat[i].nCmdRecv = 0;
+			break;
+		case SENDA2:
+			//msg(3, stat, i);
+			connStat[i].nCmdRecv = 0;
+			break;
+		case SENDF:
+			//sendfile(0, stat, i);
+			connStat[i].nCmdRecv = 0;
+			break;
+		case SENDF2:
+			//sendfile(1, stat, i);
+			connStat[i].nCmdRecv = 0;
+			break;
+		case LIST:
+			//list();
+			connStat[i].nCmdRecv = 0;
+			break;
+		case DELAY:
+			Log("delay");
+			connStat[i].nCmdRecv = 0;
+			
+	}
+}
+
 void DoServer(int svrPort) {
 	BYTE * buf = (BYTE *)malloc(MAX_REQUEST_SIZE);
 	memset(buf, 0, MAX_REQUEST_SIZE);	
@@ -201,68 +328,76 @@ void DoServer(int svrPort) {
 		for (int i=1; i<=nConns; i++) {
 			if (peers[i].revents & (POLLRDNORM | POLLERR | POLLHUP)) {
 				int fd = peers[i].fd;
+				char * split;
 				
 				// protocol message type recv request
-				if (connStat[i].nMsgRecv < sizeof(msg_type)) {
-					if ((temp = Recv_NonBlocking(fd, (BYTE *)&connStat[i].msg, sizeof(msg_type), &connStat[i], &peers[i])) < 0) {
-						Log("received %d", temp);
+				if (connStat[i].nCmdRecv < CMD_LEN) {
+					if ((temp = Recv_NonBlocking(fd, (BYTE *)&connStat[i].dataRecv, CMD_LEN, &connStat[i], &peers[i])) < 0) {
 						RemoveConnection(i);
 						continue;
 					}
 					
-					if (connStat[i].nRecv == sizeof(msg_type)) {
-						Log("%d bytes received", connStat[i].nRecv);
-						connStat[i].nToRecv = DATA_FRAME_LEN;
-						connStat[i].nMsgRecv = connStat[i].nRecv;
-						connStat[i].nRecv = 0;
-						Log("%d", connStat[i].msg);
+					if (connStat[i].nRecv == CMD_LEN) {
+						printf("%s", connStat[i].dataRecv);
+						connStat[i].nCmdRecv = connStat[i].nRecv;
+						connStat[i].nRecv = 0;					
+						
+						// Insert null character to terminate string after command type
+						split = strchr(connStat[i].dataRecv, ' ');
+						if (split != NULL) {
+							*split = '\0';
+						}
+		
+						// Convert the command string to its corresponding enumerated value
+						if ((connStat[i].msg = strToMsg(connStat[i].dataRecv)) == -1) {
+							Log("ERROR: Unknown message");
+						}
 					}
+				}
+				
+				if (connStat[i].nCmdRecv == CMD_LEN) {
+					protocol(&connStat[i], i, split);
 				}
 				
 				// protocol data recv request
-				if (connStat[i].nDataRecv < connStat[i].nToRecv) {
-					if ((temp = Recv_NonBlocking(fd, connStat[i].data, connStat[i].nToRecv, &connStat[i], &peers[i])) < 0) {
-						Log("received %d", temp);
-						RemoveConnection(i);
-						continue;
-					}
-					
-					if (connStat[i].nRecv == connStat[i].nToRecv) {
-						Log("%d bytes received", connStat[i].nRecv);
-						connStat[i].nToSend = DATA_FRAME_LEN;
-						connStat[i].nDataRecv = connStat[i].nRecv;
-						connStat[i].nRecv = 0;
-						printf("%s", connStat[i].data);
-					}
-				}
+				//if (connStat[i].nDataRecv < connStat[i].nToRecv) {
+				//	if ((temp = Recv_NonBlocking(fd, connStat[i].data, connStat[i].nToRecv, &connStat[i], &peers[i])) < 0) {
+				//		RemoveConnection(i);
+				//		continue;
+				//	}
+				//	
+				//	if (connStat[i].nRecv == connStat[i].nToRecv) {
+				//		//connStat[i].nToSend = CMD_LEN;
+				//		connStat[i].nDataRecv = connStat[i].nRecv;
+				//		connStat[i].nRecv = 0;					
+				//		connStat[i].nToSend = 0;
+				//		connStat[i].nSent = 0;
+				//		connStat[i].nCmdRecv = 0;
+				//		connStat[i].nDataRecv = 0;
+				//		char *strMsg = msgToString(connStat[i].msg);
+				//		printf("%s %s", strMsg, connStat[i].data);
+				//	}
+				//}
 				
-				if (connStat[i].nToSend != 0) {
-					if ((temp = Send_NonBlocking(peers[i].fd, connStat[i].data, connStat[i].nToSend, &connStat[i], &peers[i])) < 0 || connStat[i].nSent == connStat[i].nToSend) {
-						//Log("Disconnecting");
-						Log("sent %d", connStat[i].nSent);
-						connStat[i].nToSend = 0;
-						connStat[i].nSent = 0;
-						connStat[i].nMsgRecv = 0;
-						connStat[i].nDataRecv = 0;
-						
-						//RemoveConnection(i);
-						continue;
-					}
-				}
+				//if (connStat[i].nToSend != 0) {
+				//	if ((temp = Send_NonBlocking(peers[i].fd, connStat[i].dataSend, connStat[i].nToSend, &connStat[i], &peers[i])) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+				//		connStat[i].nToSend = 0;
+				//		connStat[i].nSent = 0;
+				//		connStat[i].nCmdRecv = 0;
+				//		connStat[i].nDataRecv = 0;
+				//		
+				//		continue;
+				//	}
+				//}
 				
 			}
 			
 			//a previously blocked data socket becomes writable
 			if (peers[i].revents & POLLWRNORM) {
 				//int msg = connStat[i].msg;
-				if (Send_NonBlocking(peers[i].fd, connStat[i].data, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
-					//Log("Disconnecting");
-					Log("%d", connStat[i].nSent);
-						connStat[i].nToSend = 0;
-						connStat[i].nSent = 0;
-						connStat[i].nMsgRecv = 0;
-						connStat[i].nDataRecv = 0;
-					//RemoveConnection(i);
+				if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+					connStat[i].nToSend = 0;
+					connStat[i].nSent = 0;
 					continue;
 				}
 			}
