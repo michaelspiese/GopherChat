@@ -20,7 +20,7 @@ typedef unsigned short WORD;
 
 #define MAX_REQUEST_SIZE 10000000
 #define CMD_LEN 275
-#define MAX_CONCURRENCY_LIMIT 64
+#define MAX_CONCURRENCY_LIMIT 10
 
 typedef enum {
 	IDLE,
@@ -36,20 +36,6 @@ typedef enum {
 	LIST,
 	DELAY
 } msg_type;
-
-struct CONN_STAT {
-	int msg;		//0 if idle/unknown
-	int nRecv;
-	int nCmdRecv;
-	int nDataRecv;
-	int nToRecv;
-	int nSent;
-	int nToSend;
-	int loggedIn;
-	char user[9];
-	char dataRecv[CMD_LEN];
-	char dataSend[CMD_LEN];
-};
 
 // converting string (from script) to enumerated protocol message
 msg_type strToMsg (char *msg) {
@@ -78,6 +64,23 @@ msg_type strToMsg (char *msg) {
 	else
 		return -1;
 }
+
+struct CONN_STAT {
+	int msg;		//0 if idle/unknown
+	int nRecv;
+	int nCmdRecv;
+	int nMsgRecv;
+	int nDataRecv;
+	int nToRecv;
+	int nSent;
+	int nSizeSent;
+	int nToSend;
+	int loggedIn;
+	char user[9];
+	char dataRecv[CMD_LEN];
+	char cmdRecv[CMD_LEN];
+	char dataSend[CMD_LEN];
+};
 
 int nConns;	//total # of data sockets
 struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
@@ -165,15 +168,32 @@ void RemoveConnection(int i) {
 	nConns--;
 }
 
-void reg(struct CONN_STAT * stat, int i, char * credentials) {
+void reg(int i) {
 	int fd = peers[i].fd;
 	char *line = (char *)malloc(sizeof(char) * 18);
 	size_t len;
 	char username[9];
 	char password[9];
-			
+	
+	// Receive the command corresponding to the message type
+	if (connStat[i].nCmdRecv < CMD_LEN) {
+		if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].cmdRecv, CMD_LEN, &connStat[i], &peers[i]) < 0) {
+			//RemoveConnection(i);
+			//continue;
+			return;
+		}
+					
+		if (connStat[i].nRecv == CMD_LEN) {
+			connStat[i].nCmdRecv = connStat[i].nRecv;
+			connStat[i].nRecv = 0;
+		}
+		else {
+			return;
+		}
+	}
+	
 	// parse for username and password
-	char *parse = strtok(credentials, " ");
+	char *parse = strtok(connStat[i].cmdRecv, " ");
 	sprintf(username, "%s", parse);
 	parse = strtok(NULL, " ");
 	sprintf(password, "%s", parse);
@@ -183,15 +203,19 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	while(getline(&line, &len, accts) != -1) {
 		parse = strtok(line, " ");
 		if (!strcmp(parse, username)) {
-			sprintf(stat->dataSend, "ERROR: User already exists with username '%s'. Please choose a new username.", username);
-			Log("%s\n", stat->dataSend);
+			sprintf(connStat[i].dataSend, "ERROR: User already exists with username '%s'. Please choose a new username.", username);
+			Log("%s\n", connStat[i].dataSend);
 			
-			stat->nCmdRecv = 0;
+			fclose(accts);
+			free(line);
+			
+			connStat[i].nCmdRecv = 0;	
+			connStat[i].nMsgRecv = 0;
+			connStat[i].nToSend = CMD_LEN;
 					
-			stat->nToSend = CMD_LEN;
-			if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
-				stat->nSent = 0;
-				stat->nToSend = 0;
+			if (Send_NonBlocking(fd, connStat[i].dataSend, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+				connStat[i].nSent = 0;
+				connStat[i].nToSend = 0;
 				return;
 			}
 			
@@ -203,15 +227,17 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	fclose(accts);
 	free(line);
 	
-	sprintf(stat->dataSend, "User '%s' registered successfully.", username);
-	Log("%s\n", stat->dataSend);
+	sprintf(connStat[i].dataSend, "User '%s' registered successfully.", username);
+	Log("%s\n", connStat[i].dataSend);
 	
-	stat->nCmdRecv = 0;
+	connStat[i].nCmdRecv = 0;	
+	connStat[i].nMsgRecv = 0;
+	connStat[i].nToSend = CMD_LEN;
 	
-	stat->nToSend = CMD_LEN;
-	if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
-		stat->nSent = 0;
-		stat->nToSend = 0;
+	//stat->nToSend = CMD_LEN;
+	if (Send_NonBlocking(fd, connStat[i].dataSend, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+		connStat[i].nSent = 0;
+		connStat[i].nToSend = 0;
 		return;
 	}
 }
@@ -317,7 +343,7 @@ void tempSend(struct CONN_STAT * stat, int i, char * str) {
 void protocol (struct CONN_STAT * stat, int i, char * body) {
 	switch (stat->msg) {
 		case REGISTER:
-			reg(stat, i, body+1);
+			//reg(stat, i, body+1);
 			break;
 		case LOGIN:
 			login(stat, i, body+1);
@@ -408,7 +434,6 @@ void DoServer(int svrPort) {
 	int connID = 0;
 	while (1) {	//the main loop		
 		//monitor the listening sock and data socks, nConn+1 in total
-		int temp;
 		r = poll(peers, nConns + 1, -1);	
 		if (r < 0) {
 			Error("Invalid poll() return value.");
@@ -437,45 +462,50 @@ void DoServer(int svrPort) {
 				int fd = peers[i].fd;
 				char * split;
 				
-				// protocol message type recv request
-				if (connStat[i].nCmdRecv < CMD_LEN) {
-					if ((temp = Recv_NonBlocking(fd, (BYTE *)&connStat[i].dataRecv, CMD_LEN, &connStat[i], &peers[i])) < 0) {
+				// Receive the type of message to act on
+				if (connStat[i].nMsgRecv < sizeof(int)) {
+					if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].msg, sizeof(int), &connStat[i], &peers[i]) < 0) {
 						RemoveConnection(i);
 						continue;
 					}
 					
-					if (connStat[i].nRecv == CMD_LEN) {
-						printf("Connection %d: %s", i, connStat[i].dataRecv);
-						connStat[i].nCmdRecv = connStat[i].nRecv;
-						connStat[i].nRecv = 0;					
-						
-						// Insert null character to terminate string after command type
-						split = strchr(connStat[i].dataRecv, ' ');
-						if (split != NULL) {
-							*split = '\0';
-						}
-		
-						// Convert the command string to its corresponding enumerated value
-						if ((connStat[i].msg = strToMsg(connStat[i].dataRecv)) == -1) {
-							Log("ERROR: Unknown message %d", connStat[i].msg);
-							continue;
-						}
+					if (connStat[i].nRecv == sizeof(int)) {
+						connStat[i].nMsgRecv = connStat[i].nRecv;
+						connStat[i].nRecv = 0;	
 					}
 				}
 				
-				if (connStat[i].nCmdRecv == CMD_LEN) {
-					protocol(&connStat[i], i, split);
+				if (connStat[i].nMsgRecv == sizeof(int)) {
+					reg(i);
 				}
-				
 			}
 			
 			//a previously blocked data socket becomes writable
 			if (peers[i].revents & POLLWRNORM) {
 				//int msg = connStat[i].msg;
-				if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
-					connStat[i].nToSend = 0;
-					connStat[i].nSent = 0;
-					continue;
+				if (connStat[i].nSizeSent < sizeof(int)) {
+					if (Send_NonBlocking(peers[i].fd, (BYTE *)&connStat[i].nToSend, sizeof(int), &connStat[i], &peers[i]) < 0) {
+						Log("sent size incorrectly");
+						continue;
+					}
+					
+					if (connStat[i].nSent == sizeof(int)) {
+						connStat[i].nSizeSent = connStat[i].nSent;
+						connStat[i].nSent = 0;
+					}
+				}
+				
+				if (connStat[i].nSizeSent == sizeof(int) && connStat[i].nSent < connStat[i].nToSend) {
+					if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, connStat[i].nToSend, &connStat[i], &peers[i]) < 0) {
+						Log("sent size incorrectly");
+						continue;
+					}
+					
+					if (connStat[i].nSent == connStat[i].nToSend) {
+						connStat[i].nSizeSent = 0;
+						connStat[i].nSent = 0;
+						
+					}
 				}
 			}
 

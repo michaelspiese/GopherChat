@@ -1,0 +1,9 @@
+REGISTER mario foobar00
+DELAY 2
+LOGIN mario foobar00
+DELAY 1
+SEND hello everyone this is mario.
+DELAY 1
+SEND2 luigi hi luigi, look at this cool pipe!
+SENDF2 luigi pipe.png
+DELAY 9999

@@ -1,0 +1,6 @@
+REGISTER luigi coolman
+DELAY 1
+LOGIN luigi coolman
+DELAY 1000
+LOGOUT
+DELAY 9999

@@ -21,29 +21,29 @@ typedef unsigned char BYTE;
 typedef unsigned int DWORD;
 typedef unsigned short WORD;
 
-// protocol messages
+// Message type structure
 typedef enum {
-	IDLE,
-	REGISTER,
-	LOGIN,
-	LOGOUT,
-	SEND,
-	SEND2,
-	SENDA,
-	SENDA2,
-	SENDF,
-	SENDF2,
-	LIST,
-	DELAY
+	IDLE, 		//0
+	REGISTER,	//1
+	LOGIN,		//2
+	LOGOUT,		//3
+	SEND,		//4
+	SEND2,		//5
+	SENDA,		//6
+	SENDA2,		//7
+	SENDF,		//8
+	SENDF2,		//9
+	LIST,		//10
+	DELAY		//11
 } msg_type;
 
 // converting string (from script) to enumerated protocol message
-msg_type strToMsg (char *msg) {
+int strToMsg (char *msg) {
 	if (!strcmp(msg, "REGISTER"))
 		return REGISTER;
 	else if (!strcmp(msg, "LOGIN"))
 		return LOGIN;
-	else if (!strcmp(msg, "LOGOUT\n"))
+	else if (!strcmp(msg, "LOGOUT"))
 		return LOGOUT;
 	else if (!strcmp(msg, "SEND"))
 		return SEND;
@@ -57,7 +57,7 @@ msg_type strToMsg (char *msg) {
 		return SENDF;
 	else if (!strcmp(msg, "SENDF2"))
 		return SENDF2;
-	else if (!strcmp(msg, "LIST\n"))
+	else if (!strcmp(msg, "LIST"))
 		return LIST;
 	else if (!strcmp(msg, "DELAY"))
 		return DELAY;
@@ -68,15 +68,16 @@ msg_type strToMsg (char *msg) {
 struct CONN_STAT {
 	int msg;		//0 if idle/unknown
 	int nRecv;
-	int nToSend;
+	int nToRecv;
 	int nSent;
+	int nToSend;
 	int timeout;
 	char data[MAX_REQUEST_SIZE];
 };
 
 int nConns;
-struct pollfd *peer;	//sockets to be monitored by poll()
-struct CONN_STAT connStat;	//app-layer stats of the sockets
+struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
+struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
 
 void Error(const char * format, ...) {
 	char msg[4096];
@@ -179,16 +180,14 @@ void SetNonBlockIO(int fd) {
 //	nConns--;
 //}
 
-int reg(int sock, char *buf) {
-	int returnMsg;
-
+int reg(int sock, char *cred) {
 	// send the username and password of the new account
-	int n = send(sock, buf, 275, 0);
+	int n = send(sock, cred, CMD_LEN, 0);
 	
-	// receive registration status back from server
-	n = recv(sock, &returnMsg, sizeof(int), 0);
-	
-	return returnMsg;
+	if (Recv_NonBlocking(peers[0].fd, connStat[0].data, CMD_LEN, &connStat[0], &peers[0]) < 0 || connStat[0].nRecv == CMD_LEN) {
+		connStat[0].nRecv = 0;
+		Log("%s", connStat[0].data);
+	}
 }
 
 /* !! THIS FUNCTION IS THE EXACT SAME AS THE REGISTER FUNCTION !! */
@@ -216,6 +215,7 @@ int logout(int sock) {
 int main(int argc, char *argv[]) {
 	char *line = (char *)malloc(sizeof(char) * CMD_LEN);
 	char *command = (char *)malloc(sizeof(char) * CMD_LEN);
+	char *buf = (char *)malloc(sizeof(char) * MAX_REQUEST_SIZE);
 	int n;
 	
 	// command line arguments must follow form detailed in project outline
@@ -223,6 +223,7 @@ int main(int argc, char *argv[]) {
 		Error("Incorrect number of arguments. Proper usage: './client [Server IP Address] [Server Port] [Input Script]'");
 	}
 	memset(line, 0, CMD_LEN);
+	memset(command, 0, CMD_LEN);
 	
 	// grab port from command line
 	int port = atoi(argv[2]);
@@ -235,17 +236,18 @@ int main(int argc, char *argv[]) {
 	inet_pton(AF_INET, argv[1], &serverAddr.sin_addr);
 	
 	// Create the socket that will receive messages
-	int sock = socket(AF_INET, SOCK_STREAM, 0);
-	if (connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr)) > 0) {	
+	int msgSock = socket(AF_INET, SOCK_STREAM, 0);
+	// SET NONBLOCK
+	if (connect(msgSock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr)) > 0) {	
 		
 	}
 
 	nConns = 0;	
-	peer = malloc(sizeof(struct pollfd));
-	memset(peer, 0, sizeof(struct pollfd));
-	peer->events = POLLRDNORM | POLLWRNORM;
-	memset(&connStat, 0, sizeof(struct CONN_STAT));
-	connStat.timeout = -1;
+	memset(peers, 0, sizeof(peers));	
+	peers[0].fd = msgSock;
+	peers[0].events = POLLRDNORM | POLLWRNORM;	
+	memset(connStat, 0, sizeof(connStat));
+	connStat[0].timeout = -1;
 	
 	// Open the input script
 	FILE * input;
@@ -255,86 +257,65 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 	
-	memset(command, 0, CMD_LEN);
-	if(getline(&line, &len, input) == -1) {
-		Log("initial getline failed");
-		return -1;
-	}
-	sprintf(command, "%s", line);
-	connStat.msg = cmdToMsg(command);
-	printf("%d\n", connStat.msg);
-	
 	while(1) {
-		int r = poll(peer, 1, connStat.timeout);	
+		// This poll effectively implements a delay
+		int r = poll(peers, nConns + 1, connStat[0].timeout);
 		if (r == 0) {
-			peer->events |= POLLWRNORM;		
-			connStat.nSent = 0;			
-			memset(command, 0, CMD_LEN);
-			if(getline(&line, &len, input) == -1) {
-				Log("EOF");
-				break;
-			}
-			sprintf(command, "%s", line);
-			connStat.msg = cmdToMsg(command);
-			if (connStat.msg == DELAY) {
-				char* parse = strtok(line, " ");
-				parse = strtok(NULL, " ");
-				connStat.nSent = CMD_LEN;
-				connStat.timeout = atoi(parse);
-			}
-			else {
-				connStat.timeout = -1;
-			}
-		}	
+			connStat[0].timeout = -1;
+			peers[0].events |= POLLWRNORM;
+		}
 		
-		// Recv request
-		if (peer->revents & (POLLRDNORM | POLLERR | POLLHUP)) {
-			if ((Recv_NonBlocking(sock, connStat.data, CMD_LEN, &connStat, peer) < 0) || connStat.nRecv == CMD_LEN) {
-				connStat.nRecv = 0;
-				Log("%s", connStat.data);
+		//if (peers[0].revents & POLLRDNORM) {
+		//	recv(peers[0].fd, (BYTE *)&connStat[0].nToRecv, sizeof(int), 0);
+		//	int n = recv(peers[0].fd, connStat[0].data, connStat[0].nToRecv, 0);
+		//	Log("%s", n, connStat[0].data);
+		//	continue;
+		//}
+		
+		if (getline(&line, &len, input) == -1) {
+			break;
+		}	
+	
+		char *split = strchr(line, ' ');
+		if (split != NULL) {
+			*split = '\0';
+		}
+		
+		printf("%s %s", line, split+1);
+		
+		// Grab the message type and command from the 
+		int msg = strToMsg(line);
+		sprintf(command, "%s", split+1);
+		
+		switch (msg) {
+			case REGISTER:
+				reg(peers[0].fd, command);
+				break;
+			case LOGIN:
+			
+			case LOGOUT:
+			
+			case SEND:
+			
+			case SEND2:
+			
+			case SENDA:
+			
+			case SENDA2:
+			
+			case SENDF:
+			
+			case SENDF2:
+			
+			case LIST:
+			
+			case DELAY: {
+				connStat[0].timeout = atoi(command);
+				peers[0].events &= ~POLLWRNORM;
 				continue;
 			}
 		}
 		
-		// Send request
-		if (peer->revents & POLLWRNORM) {
-			if (connStat.nSent < CMD_LEN) {
-				if (Send_NonBlocking(sock, command, CMD_LEN, &connStat, peer) < 0) {
-					Error("command sent incorrectly");
-				}
-				
-				if (connStat.nSent == CMD_LEN) {
-					peer->events |= POLLWRNORM;
-					connStat.nSent = 0;				
-					if ((Recv_NonBlocking(sock, connStat.data, CMD_LEN, &connStat, peer) < 0) || connStat.nRecv == CMD_LEN) {
-						connStat.nRecv = 0;
-						Log("%s", connStat.data);
-					}
-					memset(command, 0, CMD_LEN);
-					if(getline(&line, &len, input) == -1) {
-						Log("EOF");
-						break;
-					}
-					sprintf(command, "%s", line);
-					connStat.msg = cmdToMsg(command);
-					if (connStat.msg == DELAY) {
-						peer->events &= ~POLLWRNORM;
-						char* parse = strtok(line, " ");
-						parse = strtok(NULL, " ");
-						connStat.nSent = CMD_LEN;
-						connStat.timeout = atoi(parse);
-						Log("%d", connStat.timeout);
-					}
-					else {
-						connStat.timeout = -1;
-					}
-					printf("%d\n", connStat.msg);
-				}
-			}
-		
-		}
-		
-
 	}
 	
 	// Close the input file after end of file
@@ -347,7 +328,7 @@ int main(int argc, char *argv[]) {
 	free(line);
 
 	//Close socket
-	close(sock);
+	close(msgSock);
 	return 0;
 }
 
