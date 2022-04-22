@@ -34,7 +34,8 @@ typedef enum {
 	SENDF,
 	SENDF2,
 	LIST,
-	DELAY
+	DELAY,
+	RECVF
 } msg_type;
 
 struct CONN_STAT {
@@ -46,6 +47,8 @@ struct CONN_STAT {
 	int nSent;
 	int nToSend;
 	int loggedIn;
+	char * file;
+	char filename[32];
 	char user[9];
 	char dataRecv[CMD_LEN];
 	char dataSend[CMD_LEN];
@@ -75,6 +78,8 @@ msg_type strToMsg (char *msg) {
 		return LIST;
 	else if (!strcmp(msg, "DELAY"))
 		return DELAY;
+	else if (!strcmp(msg, "RECVF"))
+		return RECVF;
 	else
 		return -1;
 }
@@ -182,7 +187,7 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	accts = fopen("registered_accounts.txt", "a+");
 	while(getline(&line, &len, accts) != -1) {
 		parse = strtok(line, " ");
-		if (!strcmp(parse, username)) {
+		if (!strcmp(parse, username) || !strcmp(parse, "******")) {
 			sprintf(stat->dataSend, "ERROR: User already exists with username '%s'. Please choose a new username.", username);
 			Log("%s\n", stat->dataSend);
 			
@@ -351,7 +356,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 			char *sepMsg = strtok(NULL, "");
 			for (int j=1; j<=nConns; j++) {
 				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
-					sprintf(connStat[j].dataSend, "[******->%s]: %s", stat->user, connStat[j].user, sepMsg);
+					sprintf(connStat[j].dataSend, "[******->%s]: %s", connStat[j].user, sepMsg);
 					
 					connStat[j].nToSend = CMD_LEN;
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
@@ -361,7 +366,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				}
 			}
 			
-			sprintf(stat->dataSend, "[******->%s]: %s", stat->user, target, sepMsg);
+			sprintf(stat->dataSend, "[******->%s]: %s", target, sepMsg);
 			
 			stat->nToSend = CMD_LEN;
 			if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
@@ -395,11 +400,35 @@ void list(struct CONN_STAT * stat, int i) {
 	
 	stat->nToSend = CMD_LEN;
 	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+		Log("temp");
 		stat->nSent = 0;
 		stat->nToSend = 0;
 		return;
 	}
+	Log("temp");
 }	
+
+void recvf(struct CONN_STAT * stat, int i) {
+	printf("%d, %s\n", stat->nToRecv, stat->filename);
+
+	if (stat->nRecv < stat->nToRecv) {
+		if (Recv_NonBlocking(peers[i].fd, stat->file, stat->nToRecv, stat, &peers[i]) < 0) {
+			RemoveConnection(i);
+			return;
+		}
+		
+		if (stat->nRecv == stat->nToRecv) {
+			printf("%d\n", stat->nRecv);
+			stat->nRecv = 0;
+			stat->nCmdRecv = 0;
+			FILE * newFile = fopen(connStat[i].filename, "w");
+			fwrite(connStat[i].file, sizeof(char), connStat[i].nToRecv, newFile);
+			free(connStat[i].file);
+			fclose(newFile);
+			RemoveConnection(i);
+		}
+	}
+}
 
 void tempSend(struct CONN_STAT * stat, int i, char * str) {
 	sprintf(stat->dataSend, "%s", str);
@@ -415,6 +444,7 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 	switch (stat->msg) {
 		case REGISTER:
 			reg(stat, i, body+1);
+			connStat[i].nCmdRecv = 0;
 			break;
 		case LOGIN:
 			login(stat, i, body+1);
@@ -426,29 +456,34 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			break;
 		case SEND:
 			msg(0, stat, i, body+1);
+			connStat[i].nCmdRecv = 0;
 			break;
 		case SEND2:
 			msg(1, stat, i, body+1);
+			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDA:
 			msg(2, stat, i, body+1);
+			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDA2:
 			msg(3, stat, i, body+1);
+			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDF:
 			//sendfile(0, stat, i);
-			tempSend(stat, i, "sendf");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDF2:
 			//sendfile(1, stat, i);
-			tempSend(stat, i, "sendf2");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case LIST:
 			list(stat, i);
 			connStat[i].nCmdRecv = 0;
+			break;
+		case RECVF:
+			recvf(stat, i);
 			break;
 	}
 }
@@ -530,7 +565,7 @@ void DoServer(int svrPort) {
 					}
 					
 					if (connStat[i].nRecv == CMD_LEN) {
-						printf("Connection %d: %s", i, connStat[i].dataRecv);
+						printf("Connection %d: %s\n", i, connStat[i].dataRecv);
 						connStat[i].nCmdRecv = connStat[i].nRecv;
 						connStat[i].nRecv = 0;					
 						
@@ -545,12 +580,19 @@ void DoServer(int svrPort) {
 							Log("ERROR: Unknown message %d", connStat[i].msg);
 							continue;
 						}
+						
+						if (connStat[i].msg == RECVF) {
+							char *filesize = strtok(split+1, " ");
+							char *filename = strtok(NULL, " ");
+							sprintf(connStat[i].filename, "%s", filename);
+							connStat[i].nToRecv = atoi(filesize);
+							connStat[i].file = (char *)malloc(sizeof(char) * connStat[i].nToRecv);
+						}
 					}
 				}
 				
 				if (connStat[i].nCmdRecv == CMD_LEN) {
 					protocol(&connStat[i], i, split);
-					connStat[i].nCmdRecv = 0;
 				}
 				
 			}

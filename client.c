@@ -68,8 +68,13 @@ msg_type strToMsg (char *msg) {
 struct CONN_STAT {
 	int msg;		//0 if idle/unknown
 	int nRecv;
-	int nToSend;
 	int nSent;
+	int nStatSent;
+	int filesize;
+	char *file;
+	char filename[33];
+	char recipient[9];
+	char dataSend[CMD_LEN];
 	char data[MAX_REQUEST_SIZE];
 };
 
@@ -78,6 +83,7 @@ int timeout;
 int nConns;
 struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
 struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
+struct sockaddr_in serverAddr;
 
 void Error(const char * format, ...) {
 	char msg[4096];
@@ -180,43 +186,58 @@ void RemoveConnection(int i) {
 	nConns--;
 }
 
-int reg(int sock, char *buf) {
-	int returnMsg;
-
-	// send the username and password of the new account
-	int n = send(sock, buf, CMD_LEN, 0);
-	
-	// receive registration status back from server
-	n = recv(sock, &returnMsg, sizeof(int), 0);
-	
-	return returnMsg;
-}
-
-/* !! THIS FUNCTION IS THE EXACT SAME AS THE REGISTER FUNCTION !! */
-int login(int sock, char *buf) {
-	int returnMsg;
-	
-	// send the login credentials
-	int n = send(sock, buf, CMD_LEN, 0);
-	
-	// receive registration status back from server
-	n = recv(sock, &returnMsg, sizeof(int), 0);
-	
-	return returnMsg;
-} 
-
-int logout(int sock) {
-	int returnMsg;
-		
-	// receive registration status back from server
-	int n = recv(sock, &returnMsg, sizeof(int), 0);
-	
-	return returnMsg;
+void createDataSocket(int type, char *cmd) {
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	SetNonBlockIO(fd);
+	connect(fd, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
+	if (fd != -1) {
+		++nConns;
+		peers[nConns].fd = fd;
+		peers[nConns].events = POLLWRNORM | POLLRDNORM;
+		peers[nConns].revents = 0;
+		memset(&connStat[nConns], 0, sizeof(struct CONN_STAT));
+		if (type == SENDF) {
+			char* parse = strtok(cmd, " ");
+			parse = strtok(NULL, "");
+			sprintf(connStat[nConns].filename, "%s", parse);
+			int last = strlen(connStat[nConns].filename);
+			connStat[nConns].filename[last-1] = '\0';
+			
+			// Attempt to open the file
+			FILE * file;
+			if ((file = fopen(connStat[nConns].filename, "r")) == NULL) {
+				Log("ERROR: file does not exist");
+				RemoveConnection(nConns);
+				return;
+			}
+			
+			// Find the size of the file
+			fseek(file, 0, SEEK_END);
+			connStat[nConns].filesize = ftell(file);
+			fseek(file, 0, SEEK_SET);
+			
+			// Read the entire file into a buffer of the same size
+			connStat[nConns].file = (char *)malloc(sizeof(char) * connStat[nConns].filesize);
+			memset(connStat[nConns].file, 0, connStat[nConns].filesize);
+			fread(connStat[nConns].file, sizeof(char), connStat[nConns].filesize, file);
+			printf("%s", connStat[nConns].file);
+			
+			// Write a command consisting of the filesize to transmit and the name of the file
+			sprintf(connStat[nConns].dataSend, "RECVF %d %s", connStat[nConns].filesize, connStat[nConns].filename);
+			//if (Send_NonBlocking(fd, connStat[nConns].dataSend, CMD_LEN, &connStat[nConns], &peers[nConns]) < 0) {
+				//Error("command sent incorrectly");
+			//}
+			
+			//if (stat->nSent == CMD_LEN) {
+				//stat->nCmdSent = CMD_LEN;
+				//stat->nSent = 0;
+			//}
+		}
+	}
 }
 
 int main(int argc, char *argv[]) {
 	char *line = (char *)malloc(sizeof(char) * CMD_LEN);
-	char *command = (char *)malloc(sizeof(char) * CMD_LEN);
 	int n;
 	
 	// command line arguments must follow form detailed in project outline
@@ -229,13 +250,12 @@ int main(int argc, char *argv[]) {
 	int port = atoi(argv[2]);
 
 	//Set the destination IP address and port number
-	struct sockaddr_in serverAddr;
 	memset(&serverAddr, 0, sizeof(serverAddr));
 	serverAddr.sin_family = AF_INET;
 	serverAddr.sin_port = htons((unsigned short) port);
 	inet_pton(AF_INET, argv[1], &serverAddr.sin_addr);
 	
-	// Create the socket that will receive messages
+	// Create the non-blocking socket that will listen to send/receive messages
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
 	SetNonBlockIO(sock);
 	connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
@@ -249,7 +269,6 @@ int main(int argc, char *argv[]) {
 	peers[0].events = POLLRDNORM | POLLWRNORM;	
 	memset(connStat, 0, sizeof(connStat));
 	timeout = -1;
-	//connected = 1;
 	
 	// Open the input script
 	FILE * input;
@@ -259,26 +278,30 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 	
-	memset(command, 0, CMD_LEN);
 	if(getline(&line, &len, input) == -1) {
 		Log("initial getline failed");
 		return -1;
 	}
-	sprintf(command, "%s", line);
-	connStat[0].msg = cmdToMsg(command);
-	printf("%d\n", connStat[0].msg);
+	sprintf(connStat[0].dataSend, "%s", line);
+	connStat[0].msg = cmdToMsg(connStat[0].dataSend);
 	
 	while(1) {
 		int r = poll(peers, nConns + 1, timeout);	
 		if (r == 0) {
 			peers[0].events |= POLLWRNORM;		
-			memset(command, 0, CMD_LEN);
+			
+			memset(connStat[0].dataSend, 0, CMD_LEN);
 			if(getline(&line, &len, input) == -1) {
 				Log("EOF");
 				break;
 			}
-			sprintf(command, "%s", line);
-			connStat[0].msg = cmdToMsg(command);
+			sprintf(connStat[0].dataSend, "%s", line);
+			connStat[0].msg = cmdToMsg(connStat[0].dataSend);
+			
+			if (connStat[0].msg == SENDF || connStat[0].msg == SENDF2) {
+				createDataSocket(connStat[0].msg, connStat[0].dataSend);
+			}
+			
 			if (connStat[0].msg == DELAY) {
 				char* parse = strtok(line, " ");
 				parse = strtok(NULL, " ");
@@ -292,13 +315,12 @@ int main(int argc, char *argv[]) {
 		for (int i=0; i<=nConns; i++) {
 			// Recv request
 			if (peers[i].revents & (POLLRDNORM | POLLERR | POLLHUP)) {
-				if (Recv_NonBlocking(sock, connStat[i].data, CMD_LEN, &connStat[i], &peers[i]) < 0) {
+				if (Recv_NonBlocking(peers[i].fd, connStat[i].data, CMD_LEN, &connStat[i], &peers[i]) < 0) {
 					if (i == 0) {
 						goto end;
 					}
 					RemoveConnection(i);
 				}
-				
 				if (connStat[i].nRecv == CMD_LEN) {
 					connStat[i].nRecv = 0;
 					Log("%s", connStat[i].data);
@@ -307,21 +329,25 @@ int main(int argc, char *argv[]) {
 			
 			// Send request
 			if (peers[i].revents & POLLWRNORM) {
-				if (connStat[i].nSent < CMD_LEN) {
-					if (Send_NonBlocking(sock, command, CMD_LEN, &connStat[i], &peers[i]) < 0) {
+				if (connStat[i].nSent < CMD_LEN && !i) {
+					if (Send_NonBlocking(sock, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
 						Error("command sent incorrectly");
 					}
 					
 					if (connStat[i].nSent == CMD_LEN) {
 						connStat[i].nSent = 0;	
 						
-						memset(command, 0, CMD_LEN);
+						memset(connStat[i].dataSend, 0, CMD_LEN);
 						if(getline(&line, &len, input) == -1) {
 							Log("EOF");
 							break;
 						}
-						sprintf(command, "%s", line);
-						connStat[i].msg = cmdToMsg(command);
+						sprintf(connStat[i].dataSend, "%s", line);
+						connStat[i].msg = cmdToMsg(connStat[i].dataSend);
+						// Create a new data socket to service concurrent file send/receive
+						if (connStat[i].msg == SENDF || connStat[i].msg == SENDF2) {
+							createDataSocket(connStat[i].msg, connStat[i].dataSend);
+						}
 						if (connStat[i].msg == DELAY) {
 							peers[i].events &= ~POLLWRNORM;
 							
@@ -331,6 +357,29 @@ int main(int argc, char *argv[]) {
 						}
 						else {
 							timeout = -1;
+						}
+					}
+				}
+				if (i > 0) {
+					if (connStat[i].nStatSent < CMD_LEN) {
+						if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
+							Error("command sent incorrectly");
+							RemoveConnection(i);
+							continue;
+						}
+						if (connStat[i].nSent == CMD_LEN) {
+							connStat[i].nStatSent = CMD_LEN;
+							connStat[i].nSent = 0;
+						}
+					}
+					
+					if (connStat[i].nStatSent == CMD_LEN && connStat[i].nSent < connStat[i].filesize) {
+						if (Send_NonBlocking(sock, connStat[i].file, connStat[i].filesize, &connStat[i], &peers[i]) < 0) {
+							Error("command sent incorrectly");
+						}
+						if (connStat[i].nSent == connStat[i].filesize) {
+							connStat[i].nStatSent = 0;
+							connStat[i].nSent = 0;
 						}
 					}
 				}
@@ -346,7 +395,6 @@ int main(int argc, char *argv[]) {
 	}
 	
 	// After execution, allocated memory can be freed
-	free(command);
 	free(line);
 
 	//Close socket
