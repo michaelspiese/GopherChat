@@ -115,7 +115,7 @@ int Send_NonBlocking(int sockFD, const BYTE * data, int len, struct CONN_STAT * 
 		if (n >= 0) {
 			pStat->nSent += n;
 		} else if (n < 0 && (errno == ECONNRESET || errno == EPIPE)) {
-			Log("Connection closed.");
+			//Log("Connection closed.");
 			close(sockFD);
 			return -1;
 		} else if (n < 0 && (errno == EWOULDBLOCK)) {
@@ -139,7 +139,7 @@ int Recv_NonBlocking(int sockFD, BYTE * data, int len, struct CONN_STAT * pStat,
 		if (n > 0) {
 			pStat->nRecv += n;
 		} else if (n == 0 || (n < 0 && errno == ECONNRESET)) {
-			Log("Connection closed.");
+			//Log("Connection closed.");
 			close(sockFD);
 			return -1;
 		} else if (n < 0 && (errno == EWOULDBLOCK)) { 
@@ -162,6 +162,7 @@ void SetNonBlockIO(int fd) {
 }
 
 void RemoveConnection(int i) {
+	Log("Connection %d closed.", i);
 	close(peers[i].fd);	
 	if (i < nConns) {	
 		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
@@ -409,7 +410,6 @@ void list(struct CONN_STAT * stat, int i) {
 }	
 
 void recvf(struct CONN_STAT * stat, int i) {
-	printf("%d, %s\n", stat->nToRecv, stat->filename);
 
 	if (stat->nRecv < stat->nToRecv) {
 		if (Recv_NonBlocking(peers[i].fd, stat->file, stat->nToRecv, stat, &peers[i]) < 0) {
@@ -418,11 +418,27 @@ void recvf(struct CONN_STAT * stat, int i) {
 		}
 		
 		if (stat->nRecv == stat->nToRecv) {
-			printf("%d\n", stat->nRecv);
 			stat->nRecv = 0;
 			stat->nCmdRecv = 0;
-			FILE * newFile = fopen(connStat[i].filename, "w");
-			fwrite(connStat[i].file, sizeof(char), connStat[i].nToRecv, newFile);
+			FILE * newFile; 
+			
+			if ((newFile = fopen(connStat[i].filename, "w")) == NULL) {
+				Log("File cannot open");
+				RemoveConnection(i);
+			}
+			else {
+				Log("file '%s' opened successfully.", connStat[i].filename);
+			}
+			
+			int n;
+			if ((n = fwrite(connStat[i].file, sizeof(char), connStat[i].nToRecv, newFile)) < connStat[i].nToRecv) {
+				Log("Incorrect bytes written %d/%d", n, connStat[i].nToRecv);
+				RemoveConnection(i);
+			}
+			else if (n == connStat[i].nToRecv) {
+				Log("%d bytes written successfully to '%s'.", n, connStat[i].filename);
+			}
+			
 			free(connStat[i].file);
 			fclose(newFile);
 			RemoveConnection(i);
@@ -442,6 +458,10 @@ void tempSend(struct CONN_STAT * stat, int i, char * str) {
 
 void protocol (struct CONN_STAT * stat, int i, char * body) {
 	switch (stat->msg) {
+		case IDLE:
+			printf("IDLE received\n");
+			connStat[i].nCmdRecv = 0;
+			break;
 		case REGISTER:
 			reg(stat, i, body+1);
 			connStat[i].nCmdRecv = 0;
@@ -577,7 +597,7 @@ void DoServer(int svrPort) {
 		
 						// Convert the command string to its corresponding enumerated value
 						if ((connStat[i].msg = strToMsg(connStat[i].dataRecv)) == -1) {
-							Log("ERROR: Unknown message %d", connStat[i].msg);
+							Log("ERROR (conn %d): Unknown message %d", i, connStat[i].msg);
 							continue;
 						}
 						

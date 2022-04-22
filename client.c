@@ -131,7 +131,7 @@ int Send_NonBlocking(int sockFD, const BYTE * data, int len, struct CONN_STAT * 
 		if (n >= 0) {
 			pStat->nSent += n;
 		} else if (n < 0 && (errno == ECONNRESET || errno == EPIPE)) {
-			Log("Connection closed.");
+			//Log("Connection closed.");
 			close(sockFD);
 			return -1;
 		} else if (n < 0 && (errno == EWOULDBLOCK)) {
@@ -155,7 +155,7 @@ int Recv_NonBlocking(int sockFD, BYTE * data, int len, struct CONN_STAT * pStat,
 		if (n > 0) {
 			pStat->nRecv += n;
 		} else if (n == 0 || (n < 0 && errno == ECONNRESET)) {
-			Log("Connection closed.");
+			//Log("Connection closed.");
 			close(sockFD);
 			return -1;
 		} else if (n < 0 && (errno == EWOULDBLOCK)) { 
@@ -178,6 +178,7 @@ void SetNonBlockIO(int fd) {
 }
 
 void RemoveConnection(int i) {
+	Log("Connection %d closed.", i);
 	close(peers[i].fd);	
 	if (i < nConns) {	
 		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
@@ -220,7 +221,6 @@ void createDataSocket(int type, char *cmd) {
 			connStat[nConns].file = (char *)malloc(sizeof(char) * connStat[nConns].filesize);
 			memset(connStat[nConns].file, 0, connStat[nConns].filesize);
 			fread(connStat[nConns].file, sizeof(char), connStat[nConns].filesize, file);
-			printf("%s", connStat[nConns].file);
 			
 			// Write a command consisting of the filesize to transmit and the name of the file
 			sprintf(connStat[nConns].dataSend, "RECVF %d %s", connStat[nConns].filesize, connStat[nConns].filename);
@@ -329,7 +329,7 @@ int main(int argc, char *argv[]) {
 			
 			// Send request
 			if (peers[i].revents & POLLWRNORM) {
-				if (connStat[i].nSent < CMD_LEN && !i) {
+				if (connStat[i].nSent < CMD_LEN && (i == 0)) {
 					if (Send_NonBlocking(sock, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
 						Error("command sent incorrectly");
 					}
@@ -347,6 +347,11 @@ int main(int argc, char *argv[]) {
 						// Create a new data socket to service concurrent file send/receive
 						if (connStat[i].msg == SENDF || connStat[i].msg == SENDF2) {
 							createDataSocket(connStat[i].msg, connStat[i].dataSend);
+							memset(connStat[i].dataSend, 0, CMD_LEN);
+							sprintf(connStat[i].dataSend, "IDLE ");
+							printf("%s\n", connStat[i].dataSend);
+							connStat[i].msg = 0;
+							continue;
 						}
 						if (connStat[i].msg == DELAY) {
 							peers[i].events &= ~POLLWRNORM;
@@ -360,7 +365,7 @@ int main(int argc, char *argv[]) {
 						}
 					}
 				}
-				if (i > 0) {
+				else if (i > 0) {
 					if (connStat[i].nStatSent < CMD_LEN) {
 						if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
 							Error("command sent incorrectly");
@@ -374,7 +379,7 @@ int main(int argc, char *argv[]) {
 					}
 					
 					if (connStat[i].nStatSent == CMD_LEN && connStat[i].nSent < connStat[i].filesize) {
-						if (Send_NonBlocking(sock, connStat[i].file, connStat[i].filesize, &connStat[i], &peers[i]) < 0) {
+						if (Send_NonBlocking(peers[i].fd, connStat[i].file, connStat[i].filesize, &connStat[i], &peers[i]) < 0) {
 							Error("command sent incorrectly");
 						}
 						if (connStat[i].nSent == connStat[i].filesize) {
