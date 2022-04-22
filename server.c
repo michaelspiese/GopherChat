@@ -19,7 +19,7 @@ typedef unsigned int DWORD;
 typedef unsigned short WORD;
 
 #define MAX_REQUEST_SIZE 10000000
-#define CMD_LEN 275
+#define CMD_LEN 300
 #define MAX_CONCURRENCY_LIMIT 64
 
 typedef enum {
@@ -275,34 +275,131 @@ void logout(struct CONN_STAT * stat, int i) {
 	}
 	
 	stat->nToSend = CMD_LEN;
-	peers[i].events |= POLLWRNORM;
-	//if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
-	//	stat->nSent = 0;
-	//	stat->nToSend = 0;
-	//	return;
-	//}
+	
+	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
+		stat->nSent = 0;
+		stat->nToSend = 0;
+		return;
+	}
 }
 
 void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 	int fd = peers[i].fd;
 	
 	switch (sel) {
-		case 0: {
+		case 0: { // SEND
 			char * msgSend = (char *)malloc(sizeof(char) * CMD_LEN);
 			sprintf(msgSend, "%s: %s", stat->user, msg);
 			for (int j=1; j<=nConns; j++) {
 				if (connStat[j].loggedIn) {
 					strcpy(connStat[j].dataSend, msgSend);
+					
 					connStat[j].nToSend = CMD_LEN;
-					peers[j].events |= POLLWRNORM;
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+						connStat[j].nSent = 0;
+						connStat[j].nToSend = 0;
+					}
 				}
 			}
 			
 			free(msgSend);
 			break;
 		}
+		case 1: {
+			char *target = strtok(msg, " ");
+			char *sepMsg = strtok(NULL, "");
+			for (int j=1; j<=nConns; j++) {
+				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
+					sprintf(connStat[j].dataSend, "[%s->%s]: %s", stat->user, connStat[j].user, sepMsg);
+					
+					connStat[j].nToSend = CMD_LEN;
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+						connStat[j].nSent = 0;
+						connStat[j].nToSend = 0;
+					}
+				}
+			}
+			
+			sprintf(stat->dataSend, "[%s->%s]: %s", stat->user, target, sepMsg);
+			stat->nToSend = CMD_LEN;
+			if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+				stat->nSent = 0;
+				stat->nToSend = 0;
+			}
+			break;
+		}
+		case 2: {
+			char * msgSend = (char *)malloc(sizeof(char) * CMD_LEN);
+			sprintf(msgSend, "******: %s", msg);
+			for (int j=1; j<=nConns; j++) {
+				if (connStat[j].loggedIn) {
+					strcpy(connStat[j].dataSend, msgSend);
+					
+					connStat[j].nToSend = CMD_LEN;
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+						connStat[j].nSent = 0;
+						connStat[j].nToSend = 0;
+					}
+				}
+			}
+			
+			free(msgSend);
+			break;
+		}
+		case 3: {
+			char *target = strtok(msg, " ");
+			char *sepMsg = strtok(NULL, "");
+			for (int j=1; j<=nConns; j++) {
+				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
+					sprintf(connStat[j].dataSend, "[******->%s]: %s", stat->user, connStat[j].user, sepMsg);
+					
+					connStat[j].nToSend = CMD_LEN;
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+						connStat[j].nSent = 0;
+						connStat[j].nToSend = 0;
+					}
+				}
+			}
+			
+			sprintf(stat->dataSend, "[******->%s]: %s", stat->user, target, sepMsg);
+			
+			stat->nToSend = CMD_LEN;
+			if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+				stat->nSent = 0;
+				stat->nToSend = 0;
+			}
+			break;
+		}
 	}
 }
+
+void list(struct CONN_STAT * stat, int i) {
+	char msgResp[CMD_LEN];
+	memset(msgResp, 0, CMD_LEN);
+	
+	for (int j=1; j<=nConns; j++) {
+		if (connStat[j].loggedIn) {
+			char userFormatted[11];
+			
+			if (strlen(msgResp) == 0)
+				sprintf(userFormatted, "%s", connStat[j].user);
+			else
+				sprintf(userFormatted, ", %s", connStat[j].user);
+				
+			strcat(msgResp, userFormatted);
+		}
+	}
+	
+	sprintf(stat->dataSend, "Users online: %s", msgResp);
+	printf("%s\n", stat->dataSend);
+	
+	stat->nToSend = CMD_LEN;
+	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+		stat->nSent = 0;
+		stat->nToSend = 0;
+		return;
+	}
+}	
 
 void tempSend(struct CONN_STAT * stat, int i, char * str) {
 	sprintf(stat->dataSend, "%s", str);
@@ -329,22 +426,15 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			break;
 		case SEND:
 			msg(0, stat, i, body+1);
-			connStat[i].nCmdRecv = 0;
 			break;
 		case SEND2:
-			//msg(1, stat, i);
-			tempSend(stat, i, "send2");
-			connStat[i].nCmdRecv = 0;
+			msg(1, stat, i, body+1);
 			break;
 		case SENDA:
-			//msg(2, stat, i);
-			tempSend(stat, i, "senda");
-			connStat[i].nCmdRecv = 0;
+			msg(2, stat, i, body+1);
 			break;
 		case SENDA2:
-			//msg(3, stat, i);
-			tempSend(stat, i, "senda2");
-			connStat[i].nCmdRecv = 0;
+			msg(3, stat, i, body+1);
 			break;
 		case SENDF:
 			//sendfile(0, stat, i);
@@ -357,14 +447,9 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			connStat[i].nCmdRecv = 0;
 			break;
 		case LIST:
-			//list();
-			tempSend(stat, i, "list");
+			list(stat, i);
 			connStat[i].nCmdRecv = 0;
 			break;
-		case DELAY:	
-			tempSend(stat, i, "delay");
-			connStat[i].nCmdRecv = 0;
-			
 	}
 }
 
@@ -465,6 +550,7 @@ void DoServer(int svrPort) {
 				
 				if (connStat[i].nCmdRecv == CMD_LEN) {
 					protocol(&connStat[i], i, split);
+					connStat[i].nCmdRecv = 0;
 				}
 				
 			}

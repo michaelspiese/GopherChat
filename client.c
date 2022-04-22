@@ -14,7 +14,7 @@
 #include <signal.h>
 
 #define MAX_REQUEST_SIZE 10000000
-#define CMD_LEN 275
+#define CMD_LEN 300
 #define MAX_CONCURRENCY_LIMIT 8
 
 typedef unsigned char BYTE;
@@ -70,13 +70,14 @@ struct CONN_STAT {
 	int nRecv;
 	int nToSend;
 	int nSent;
-	int timeout;
 	char data[MAX_REQUEST_SIZE];
 };
 
+int connected;
+int timeout;
 int nConns;
-struct pollfd *peer;	//sockets to be monitored by poll()
-struct CONN_STAT connStat;	//app-layer stats of the sockets
+struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
+struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
 
 void Error(const char * format, ...) {
 	char msg[4096];
@@ -170,20 +171,20 @@ void SetNonBlockIO(int fd) {
 	}
 }
 
-//void RemoveConnection(int i) {
-//	close(peers[i].fd);	
-//	if (i < nConns) {	
-//		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
-//		memmove(connStat + i, connStat + i + 1, (nConns-i) * sizeof(struct CONN_STAT));
-//	}
-//	nConns--;
-//}
+void RemoveConnection(int i) {
+	close(peers[i].fd);	
+	if (i < nConns) {	
+		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
+		memmove(connStat + i, connStat + i + 1, (nConns-i) * sizeof(struct CONN_STAT));
+	}
+	nConns--;
+}
 
 int reg(int sock, char *buf) {
 	int returnMsg;
 
 	// send the username and password of the new account
-	int n = send(sock, buf, 275, 0);
+	int n = send(sock, buf, CMD_LEN, 0);
 	
 	// receive registration status back from server
 	n = recv(sock, &returnMsg, sizeof(int), 0);
@@ -196,7 +197,7 @@ int login(int sock, char *buf) {
 	int returnMsg;
 	
 	// send the login credentials
-	int n = send(sock, buf, 275, 0);
+	int n = send(sock, buf, CMD_LEN, 0);
 	
 	// receive registration status back from server
 	n = recv(sock, &returnMsg, sizeof(int), 0);
@@ -236,16 +237,19 @@ int main(int argc, char *argv[]) {
 	
 	// Create the socket that will receive messages
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
-	if (connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr)) > 0) {	
-		
+	SetNonBlockIO(sock);
+	connect(sock, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
+	if (errno != EINPROGRESS) {	
+		Error("Client failed to connect. %s", strerror(errno));
 	}
 
 	nConns = 0;	
-	peer = malloc(sizeof(struct pollfd));
-	memset(peer, 0, sizeof(struct pollfd));
-	peer->events = POLLRDNORM | POLLWRNORM;
-	memset(&connStat, 0, sizeof(struct CONN_STAT));
-	connStat.timeout = -1;
+	memset(peers, 0, sizeof(peers));	
+	peers[0].fd = sock;
+	peers[0].events = POLLRDNORM | POLLWRNORM;	
+	memset(connStat, 0, sizeof(connStat));
+	timeout = -1;
+	//connected = 1;
 	
 	// Open the input script
 	FILE * input;
@@ -261,81 +265,80 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 	sprintf(command, "%s", line);
-	connStat.msg = cmdToMsg(command);
-	printf("%d\n", connStat.msg);
+	connStat[0].msg = cmdToMsg(command);
+	printf("%d\n", connStat[0].msg);
 	
 	while(1) {
-		int r = poll(peer, 1, connStat.timeout);	
+		int r = poll(peers, nConns + 1, timeout);	
 		if (r == 0) {
-			peer->events |= POLLWRNORM;		
-			connStat.nSent = 0;			
+			peers[0].events |= POLLWRNORM;		
 			memset(command, 0, CMD_LEN);
 			if(getline(&line, &len, input) == -1) {
 				Log("EOF");
 				break;
 			}
 			sprintf(command, "%s", line);
-			connStat.msg = cmdToMsg(command);
-			if (connStat.msg == DELAY) {
+			connStat[0].msg = cmdToMsg(command);
+			if (connStat[0].msg == DELAY) {
 				char* parse = strtok(line, " ");
 				parse = strtok(NULL, " ");
-				connStat.nSent = CMD_LEN;
-				connStat.timeout = atoi(parse);
+				timeout = atoi(parse);
 			}
 			else {
-				connStat.timeout = -1;
+				timeout = -1;
 			}
 		}	
 		
-		// Recv request
-		if (peer->revents & (POLLRDNORM | POLLERR | POLLHUP)) {
-			if ((Recv_NonBlocking(sock, connStat.data, CMD_LEN, &connStat, peer) < 0) || connStat.nRecv == CMD_LEN) {
-				connStat.nRecv = 0;
-				Log("%s", connStat.data);
-				continue;
-			}
-		}
-		
-		// Send request
-		if (peer->revents & POLLWRNORM) {
-			if (connStat.nSent < CMD_LEN) {
-				if (Send_NonBlocking(sock, command, CMD_LEN, &connStat, peer) < 0) {
-					Error("command sent incorrectly");
+		for (int i=0; i<=nConns; i++) {
+			// Recv request
+			if (peers[i].revents & (POLLRDNORM | POLLERR | POLLHUP)) {
+				if (Recv_NonBlocking(sock, connStat[i].data, CMD_LEN, &connStat[i], &peers[i]) < 0) {
+					if (i == 0) {
+						goto end;
+					}
+					RemoveConnection(i);
 				}
 				
-				if (connStat.nSent == CMD_LEN) {
-					peer->events |= POLLWRNORM;
-					connStat.nSent = 0;				
-					if ((Recv_NonBlocking(sock, connStat.data, CMD_LEN, &connStat, peer) < 0) || connStat.nRecv == CMD_LEN) {
-						connStat.nRecv = 0;
-						Log("%s", connStat.data);
-					}
-					memset(command, 0, CMD_LEN);
-					if(getline(&line, &len, input) == -1) {
-						Log("EOF");
-						break;
-					}
-					sprintf(command, "%s", line);
-					connStat.msg = cmdToMsg(command);
-					if (connStat.msg == DELAY) {
-						peer->events &= ~POLLWRNORM;
-						char* parse = strtok(line, " ");
-						parse = strtok(NULL, " ");
-						connStat.nSent = CMD_LEN;
-						connStat.timeout = atoi(parse);
-						Log("%d", connStat.timeout);
-					}
-					else {
-						connStat.timeout = -1;
-					}
-					printf("%d\n", connStat.msg);
+				if (connStat[i].nRecv == CMD_LEN) {
+					connStat[i].nRecv = 0;
+					Log("%s", connStat[i].data);
 				}
 			}
-		
+			
+			// Send request
+			if (peers[i].revents & POLLWRNORM) {
+				if (connStat[i].nSent < CMD_LEN) {
+					if (Send_NonBlocking(sock, command, CMD_LEN, &connStat[i], &peers[i]) < 0) {
+						Error("command sent incorrectly");
+					}
+					
+					if (connStat[i].nSent == CMD_LEN) {
+						connStat[i].nSent = 0;	
+						
+						memset(command, 0, CMD_LEN);
+						if(getline(&line, &len, input) == -1) {
+							Log("EOF");
+							break;
+						}
+						sprintf(command, "%s", line);
+						connStat[i].msg = cmdToMsg(command);
+						if (connStat[i].msg == DELAY) {
+							peers[i].events &= ~POLLWRNORM;
+							
+							char* parse = strtok(line, " ");
+							parse = strtok(NULL, " ");
+							timeout = atoi(parse);
+						}
+						else {
+							timeout = -1;
+						}
+					}
+				}
+			}
 		}
-		
-
 	}
+	
+	end: // If the connection to the server is lost on the command socket, go here
 	
 	// Close the input file after end of file
 	if (fclose(input) < 0) {
