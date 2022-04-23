@@ -1,3 +1,12 @@
-REGISTER test4 test4
-LOGIN test4 test4
+REGISTER mario foobar00
+DELAY 2
+LOGIN mario foobar00
 DELAY 1
+LIST
+DELAY 1
+SENDA hello everyone this is mario.
+DELAY 1
+SENDA2 luigi hi luigi, look at this cool pipe!
+DELAY 1
+SENDF test.png
+DELAY 9999

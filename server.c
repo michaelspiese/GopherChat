@@ -56,7 +56,9 @@ struct CONN_STAT {
 
 // converting string (from script) to enumerated protocol message
 msg_type strToMsg (char *msg) {
-	if (!strcmp(msg, "REGISTER"))
+	if (!strcmp(msg, "IDLE"))
+		return IDLE;
+	else if (!strcmp(msg, "REGISTER"))
 		return REGISTER;
 	else if (!strcmp(msg, "LOGIN"))
 		return LOGIN;
@@ -188,8 +190,8 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	accts = fopen("registered_accounts.txt", "a+");
 	while(getline(&line, &len, accts) != -1) {
 		parse = strtok(line, " ");
-		if (!strcmp(parse, username) || !strcmp(parse, "******")) {
-			sprintf(stat->dataSend, "ERROR: User already exists with username '%s'. Please choose a new username.", username);
+		if (!strcmp(parse, username) || !strcmp(parse, "******")|| !strcmp(parse, "LISTEN")) {
+			sprintf(stat->dataSend, "ERROR: Invalid username '%s'. Please choose a new username.", username);
 			Log("%s\n", stat->dataSend);
 			
 			stat->nCmdRecv = 0;
@@ -409,7 +411,7 @@ void list(struct CONN_STAT * stat, int i) {
 	Log("temp");
 }	
 
-void recvf(struct CONN_STAT * stat, int i) {
+void sendf(struct CONN_STAT * stat, int i) {
 
 	if (stat->nRecv < stat->nToRecv) {
 		if (Recv_NonBlocking(peers[i].fd, stat->file, stat->nToRecv, stat, &peers[i]) < 0) {
@@ -439,8 +441,24 @@ void recvf(struct CONN_STAT * stat, int i) {
 				Log("%d bytes written successfully to '%s'.", n, connStat[i].filename);
 			}
 			
+			// Now that file has been written, close file, free allocated buffer
 			free(connStat[i].file);
 			fclose(newFile);
+			
+			// TODO: !! not the sender !!
+			// We must now send the file back to all logged in users
+			for (int j=0; j<=nConns; j++) {
+				if (connStat[j].loggedIn) {
+					sprintf(connStat[j].dataSend, "LISTEN %d %s", connStat[i].nToRecv, connStat[i].filename);
+					
+					connStat[j].nToSend = CMD_LEN;
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, connStat[j].nToSend, &connStat[j], &peers[j]) < 0) {
+						Log("Failed to send CHECK SENDF");
+					}
+				}
+			}
+			
+			// Now that the file has been received and commands have been echoed back to online clients, disconnect the transmitting helper
 			RemoveConnection(i);
 		}
 	}
@@ -491,8 +509,7 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDF:
-			//sendfile(0, stat, i);
-			connStat[i].nCmdRecv = 0;
+			sendf(stat, i);
 			break;
 		case SENDF2:
 			//sendfile(1, stat, i);
@@ -503,7 +520,6 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			connStat[i].nCmdRecv = 0;
 			break;
 		case RECVF:
-			recvf(stat, i);
 			break;
 	}
 }
@@ -601,7 +617,7 @@ void DoServer(int svrPort) {
 							continue;
 						}
 						
-						if (connStat[i].msg == RECVF) {
+						if (connStat[i].msg == SENDF) {
 							char *filesize = strtok(split+1, " ");
 							char *filename = strtok(NULL, " ");
 							sprintf(connStat[i].filename, "%s", filename);
