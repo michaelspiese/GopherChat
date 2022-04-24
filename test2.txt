@@ -1,6 +1,6 @@
 REGISTER luigi coolman
-DELAY 1
+DELAY 2
 LOGIN luigi coolman
-DELAY 1000
-LOGOUT
-DELAY 9999
+DELAY 2000
+SEND this is a test.
+DELAY 99999

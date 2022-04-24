@@ -20,7 +20,10 @@ typedef unsigned short WORD;
 
 #define MAX_REQUEST_SIZE 10000000
 #define CMD_LEN 300
-#define MAX_CONCURRENCY_LIMIT 64
+#define MAX_CONCURRENCY_LIMIT 18
+#define MAX_FILENAME 32
+#define MIN_CRED 4
+#define MAX_CRED 8
 
 typedef enum {
 	IDLE,
@@ -46,10 +49,11 @@ struct CONN_STAT {
 	int nToRecv;
 	int nSent;
 	int nToSend;
+	int ID;
 	int loggedIn;
 	char * file;
-	char filename[32];
-	char user[9];
+	char filename[MAX_FILENAME];
+	char user[MAX_CRED];
 	char dataRecv[CMD_LEN];
 	char dataSend[CMD_LEN];
 };
@@ -84,6 +88,7 @@ msg_type strToMsg (char *msg) {
 		return -1;
 }
 
+int connID; // Running total of connection numbers
 int nConns;	//total # of data sockets
 struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
 struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
@@ -109,8 +114,6 @@ void Log(const char * format, ...) {
 
 int Send_NonBlocking(int sockFD, const BYTE * data, int len, struct CONN_STAT * pStat, struct pollfd * pPeer) {	
 	while (pStat->nSent < len) {
-		//pStat keeps tracks of how many bytes have been sent, allowing us to "resume" 
-		//when a previously non-writable socket becomes writable. 
 		int n = send(sockFD, data + pStat->nSent, len - pStat->nSent, 0);
 		if (n >= 0) {
 			pStat->nSent += n;
@@ -131,9 +134,7 @@ int Send_NonBlocking(int sockFD, const BYTE * data, int len, struct CONN_STAT * 
 	return 0;
 }
 
-int Recv_NonBlocking(int sockFD, BYTE * data, int len, struct CONN_STAT * pStat, struct pollfd * pPeer) { // void * data?
-	//pStat keeps tracks of how many bytes have been rcvd, allowing us to "resume" 
-	//when a previously non-readable socket becomes readable. 
+int Recv_NonBlocking(int sockFD, BYTE * data, int len, struct CONN_STAT * pStat, struct pollfd * pPeer) {
 	while (pStat->nRecv < len) {
 		int n = recv(sockFD, data + pStat->nRecv, len - pStat->nRecv, 0);
 		if (n > 0) {
@@ -162,7 +163,7 @@ void SetNonBlockIO(int fd) {
 }
 
 void RemoveConnection(int i) {
-	Log("Connection %d closed.", i);
+	Log("Connection %d closed. (Position %d in struct array)", connStat[i].ID, i);
 	close(peers[i].fd);	
 	if (i < nConns) {	
 		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
@@ -173,10 +174,10 @@ void RemoveConnection(int i) {
 
 void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	int fd = peers[i].fd;
-	char *line = (char *)malloc(sizeof(char) * 18);
+	char *line = (char *)malloc(sizeof(char) * CMD_LEN);
 	size_t len;
-	char username[9];
-	char password[9];
+	char username[64];
+	char password[64];
 			
 	// parse for username and password
 	char *parse = strtok(credentials, " ");
@@ -184,15 +185,51 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	parse = strtok(NULL, " ");
 	sprintf(password, "%s", parse);
 	
+	int uLen = strlen(username);
+	int pLen = strlen(password) - 1; // Accounting for newline from command
+	
+	// Checking if the username and password are valid sizes
+	if (uLen < MIN_CRED || uLen > MAX_CRED || pLen < MIN_CRED || pLen > MAX_CRED) {
+		sprintf(stat->dataSend, "ERROR Credentials are of invalid size (must be between 4 and 8 characters). Username is %d characters and password is %d characters.", uLen, pLen);
+		Log("%s", stat->dataSend);
+		
+		stat->nCmdRecv = 0;
+				
+		stat->nToSend = CMD_LEN;
+		if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
+			stat->nSent = 0;
+			stat->nToSend = 0;
+			return;
+		}
+		
+		return;
+	}
+	
+	// Open the account file and check if there is already an account with the target username
 	FILE *accts;
 	accts = fopen("registered_accounts.txt", "a+");
 	while(getline(&line, &len, accts) != -1) {
 		parse = strtok(line, " ");
-		if (!strcmp(parse, username) || !strcmp(parse, "******")) {
-			sprintf(stat->dataSend, "ERROR: User already exists with username '%s'. Please choose a new username.", username);
-			Log("%s\n", stat->dataSend);
+		
+		// If there is already an account with a matching name send an error
+		if (!strcmp(parse, username)) {
+			sprintf(stat->dataSend, "ERROR User already exists with username '%s'. Please choose a new username.", username);
+			Log("%s", stat->dataSend);
+					
+			stat->nToSend = CMD_LEN;
+			if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
+				stat->nSent = 0;
+				stat->nToSend = 0;
+				return;
+			}
 			
-			stat->nCmdRecv = 0;
+			return;
+		}
+		
+		// If a user tries to name themselves after an internal command send an error
+		if (strToMsg(username) != -1) {
+			sprintf(stat->dataSend, "ERROR '%s' is an invalid username because it is an internal server command. Please choose a new username.", username);
+			Log("%s", stat->dataSend);
 					
 			stat->nToSend = CMD_LEN;
 			if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
@@ -205,15 +242,16 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 		}
 	}
 	
+	// Save the username and password of the new account to the accounts file, then close it and free the line buffer
 	fprintf(accts, "%s %s", username, password);
 	fclose(accts);
 	free(line);
 	
-	sprintf(stat->dataSend, "User '%s' registered successfully.", username);
-	Log("%s\n", stat->dataSend);
+	// Format a success message and send it back to the client
+	sprintf(stat->dataSend, "PRINT User '%s' registered successfully.", username);
+	Log("%s", stat->dataSend);
 	
-	stat->nCmdRecv = 0;
-	
+	// Initiate sending the success message back to the client
 	stat->nToSend = CMD_LEN;
 	if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
 		stat->nSent = 0;
@@ -226,8 +264,21 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 	int fd = peers[i].fd;
 	char *line = (char *)malloc(sizeof(char) * 18);
 	size_t len;
-	char username[9];
+	char username[8];
 	char password[9];
+	
+	// Make sure the client does not attempt to log in as another user while they are already logged in
+	if (stat->loggedIn) {
+		sprintf(stat->dataSend, "ERROR You are already logged in as '%s'.", stat->user);
+		Log("%s", stat->dataSend);
+		
+		stat->nToSend = CMD_LEN;
+		if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
+			stat->nSent = 0;
+			stat->nToSend = 0;
+			return;
+		}
+	}
 			
 	// parse for username and password
 	char *parse = strtok(credentials, " ");
@@ -235,31 +286,65 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 	parse = strtok(NULL, " ");
 	sprintf(password, "%s", parse);
 	
+	// Open the accounts file to check if the user exists
 	FILE *accts;
-	accts = fopen("registered_accounts.txt", "r");
+	if((accts = fopen("registered_accounts.txt", "r")) == NULL) {
+		
+	}
+	
+	// Iterate through all accounts to find matching account
 	while(getline(&line, &len, accts) != -1) {
 		parse = strtok(line, " ");
 		if (!strcmp(parse, username)) {
+			int logCheck = 0;
+			// Check if user is already logged in
+			for (int j=1; j<=nConns; j++) {
+				if (!strcmp(username, connStat[j].user)) {
+					logCheck = 1;
+					sprintf(stat->dataSend, "ERROR User '%s' is already logged in.", username);
+					Log("%s", stat->dataSend);
+					break;
+				}
+			}
+			if (logCheck) {
+				break;
+			}
+			
+			// Check to make sure the correct password was supplied. If it was, store username and set state to logged in
 			parse = strtok(NULL, " ");
 			if (!strcmp(parse, password)) {
+				// Relay that the user has logged in to all other online users
+				for (int j=1; j<=nConns; j++) {
+					if (connStat[j].loggedIn) {
+						sprintf(connStat[j].dataSend, "PRINT '%s' has logged in.", username);
+						connStat[j].nToSend = CMD_LEN;
+						if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+							connStat[j].nSent = 0;
+							connStat[j].nToSend = 0;
+						}
+					}
+				}	
+			
+				// Log in the user
 				strcpy(stat->user, username);
 				stat->loggedIn = 1;
-				sprintf(stat->dataSend, "Successfully logged in user '%s'.", username);
-				Log("%s\n", stat->dataSend);
+				sprintf(stat->dataSend, "PRINT Successfully logged in user '%s'.", username);
+				Log("%s", stat->dataSend);
+				break;
+			}
+			else {
+				sprintf(stat->dataSend, "ERROR Invalid user credentials.");
+				Log("%s", stat->dataSend);
+				break;
 			}
 		}
 	}
 	
+	// Close the accounts file and free the line buffer
 	fclose(accts);
 	free(line);
 	
-	if (!stat->loggedIn) {
-		sprintf(stat->dataSend, "Invalid user credentials.");
-		Log("%s\n", stat->dataSend);
-	}
-	
-	stat->nCmdRecv = 0;
-	
+	// Send the appropriate message back to the client
 	stat->nToSend = CMD_LEN;
 	if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
 		stat->nSent = 0;
@@ -269,19 +354,20 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 }
 
 void logout(struct CONN_STAT * stat, int i) {
+	// Make sure the user is logged in first before logging them out, otherwise return an error message
 	if (stat->loggedIn) {
-		sprintf(stat->dataSend, "Logging out user '%s'. Thanks for using GopherChat!", stat->user);
-		Log("%s\n", stat->dataSend);
-		memset(stat->user, 0, 9);
+		sprintf(stat->dataSend, "PRINT Logging out user '%s'. Thanks for using GopherChat!", stat->user);
+		Log("%s", stat->dataSend);
+		memset(stat->user, 0, 8);
 		stat->loggedIn = 0;
 	}
 	else {
-		sprintf(stat->dataSend, "Cannot log out, you are not logged in.");
-		Log("%s\n", stat->dataSend);
+		sprintf(stat->dataSend, "ERROR Cannot log out, you are not logged in.");
+		Log("%s", stat->dataSend);
 	}
 	
+	// Send the response message back to the client
 	stat->nToSend = CMD_LEN;
-	
 	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
 		stat->nSent = 0;
 		stat->nToSend = 0;
@@ -292,11 +378,87 @@ void logout(struct CONN_STAT * stat, int i) {
 void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 	int fd = peers[i].fd;
 	
+	// Remove the newline character from teh input script if it exists for formatting purposes
+	int last = strlen(msg);
+	if (msg[last-1] == '\n') {
+		msg[last-1] = '\0';
+	}
+	
+	// Based on the type of message, format the message and send it to the appropriate recipients (sender is included for messages)
 	switch (sel) {
-		case 0: { // SEND
+		case SEND: {
 			char * msgSend = (char *)malloc(sizeof(char) * CMD_LEN);
-			sprintf(msgSend, "%s: %s", stat->user, msg);
+			sprintf(msgSend, "PRINT %s: %s", stat->user, msg);
 			for (int j=1; j<=nConns; j++) {
+				// Send the message to all online users
+				if (connStat[j].loggedIn) {
+					strcpy(connStat[j].dataSend, msgSend);
+					
+					connStat[j].nToSend = CMD_LEN;
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+						connStat[j].nSent = 0;
+						connStat[j].nToSend = 0;
+					}
+				}
+			}
+			free(msgSend);
+			break;
+		}
+		case SEND2: {
+			char *target = strtok(msg, " ");
+			char *sepMsg = strtok(NULL, "");
+			int userOnline = 0;
+			
+			// If the user is attempting to send a private message to themselves, send an error message
+			if (!strcmp(stat->user, target)) {
+				sprintf(stat->dataSend, "ERROR You are attempting to send a private message to yourself.");
+				stat->nToSend = CMD_LEN;
+				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+					stat->nSent = 0;
+					stat->nToSend = 0;
+				}
+				break;
+			}
+			
+			// Search through all connections to find the target user
+			for (int j=1; j<=nConns; j++) {
+				// If the user is online, send them the private message
+				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
+					userOnline = 1;
+					sprintf(connStat[j].dataSend, "PRINT [%s->%s]: %s", stat->user, connStat[j].user, sepMsg);
+					
+					connStat[j].nToSend = CMD_LEN;
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+						connStat[j].nSent = 0;
+						connStat[j].nToSend = 0;
+					}
+				}
+			}
+			
+			// Send the sender the appropriate message based on if the target is online
+			if (userOnline) {
+				sprintf(stat->dataSend, "PRINT [you->%s]: %s", target, sepMsg);
+				stat->nToSend = CMD_LEN;
+				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+					stat->nSent = 0;
+					stat->nToSend = 0;
+				}
+			}
+			else {
+				sprintf(stat->dataSend, "ERROR User '%s' is not online.", target);
+				stat->nToSend = CMD_LEN;
+				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+					stat->nSent = 0;
+					stat->nToSend = 0;
+				}
+			}
+			break;
+		}
+		case SENDA: {
+			char * msgSend = (char *)malloc(sizeof(char) * CMD_LEN);
+			sprintf(msgSend, "PRINT ******: %s", msg);
+			for (int j=1; j<=nConns; j++) {
+				// Send the anonymous message to all online users
 				if (connStat[j].loggedIn) {
 					strcpy(connStat[j].dataSend, msgSend);
 					
@@ -311,12 +473,28 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 			free(msgSend);
 			break;
 		}
-		case 1: {
+		case SENDA2: {
 			char *target = strtok(msg, " ");
 			char *sepMsg = strtok(NULL, "");
+			int userOnline = 0;
+			
+			// If the user is attempting to send a private message to themselves, send an error message
+			if (!strcmp(stat->user, target)) {
+				sprintf(stat->dataSend, "ERROR You are attempting to send a private message to yourself.");
+				stat->nToSend = CMD_LEN;
+				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+					stat->nSent = 0;
+					stat->nToSend = 0;
+				}
+				break;
+			}
+			
+			// Search through all connections to find the target user
 			for (int j=1; j<=nConns; j++) {
+				// If the user is online, send them the anonymous private message
 				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
-					sprintf(connStat[j].dataSend, "[%s->%s]: %s", stat->user, connStat[j].user, sepMsg);
+					userOnline = 1;
+					sprintf(connStat[j].dataSend, "PRINT [******->%s]: %s", connStat[j].user, sepMsg);
 					
 					connStat[j].nToSend = CMD_LEN;
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
@@ -326,53 +504,22 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				}
 			}
 			
-			sprintf(stat->dataSend, "[%s->%s]: %s", stat->user, target, sepMsg);
-			stat->nToSend = CMD_LEN;
-			if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
-				stat->nSent = 0;
-				stat->nToSend = 0;
-			}
-			break;
-		}
-		case 2: {
-			char * msgSend = (char *)malloc(sizeof(char) * CMD_LEN);
-			sprintf(msgSend, "******: %s", msg);
-			for (int j=1; j<=nConns; j++) {
-				if (connStat[j].loggedIn) {
-					strcpy(connStat[j].dataSend, msgSend);
-					
-					connStat[j].nToSend = CMD_LEN;
-					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
-						connStat[j].nSent = 0;
-						connStat[j].nToSend = 0;
-					}
+			// Send the sender the appropriate message based on if the target is online
+			if (userOnline) {
+				sprintf(stat->dataSend, "PRINT [(you)->%s]: %s", target, sepMsg);
+				stat->nToSend = CMD_LEN;
+				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+					stat->nSent = 0;
+					stat->nToSend = 0;
 				}
 			}
-			
-			free(msgSend);
-			break;
-		}
-		case 3: {
-			char *target = strtok(msg, " ");
-			char *sepMsg = strtok(NULL, "");
-			for (int j=1; j<=nConns; j++) {
-				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
-					sprintf(connStat[j].dataSend, "[******->%s]: %s", connStat[j].user, sepMsg);
-					
-					connStat[j].nToSend = CMD_LEN;
-					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
-						connStat[j].nSent = 0;
-						connStat[j].nToSend = 0;
-					}
+			else {
+				sprintf(stat->dataSend, "ERROR User '%s' is not online.", target);
+				stat->nToSend = CMD_LEN;
+				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+					stat->nSent = 0;
+					stat->nToSend = 0;
 				}
-			}
-			
-			sprintf(stat->dataSend, "[******->%s]: %s", target, sepMsg);
-			
-			stat->nToSend = CMD_LEN;
-			if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
-				stat->nSent = 0;
-				stat->nToSend = 0;
 			}
 			break;
 		}
@@ -383,10 +530,12 @@ void list(struct CONN_STAT * stat, int i) {
 	char msgResp[CMD_LEN];
 	memset(msgResp, 0, CMD_LEN);
 	
+	// Iterate through all open connections for logged in users
 	for (int j=1; j<=nConns; j++) {
 		if (connStat[j].loggedIn) {
 			char userFormatted[11];
 			
+			// If the user is logged in, add then to the formatted list
 			if (strlen(msgResp) == 0)
 				sprintf(userFormatted, "%s", connStat[j].user);
 			else
@@ -396,17 +545,15 @@ void list(struct CONN_STAT * stat, int i) {
 		}
 	}
 	
-	sprintf(stat->dataSend, "Users online: %s", msgResp);
+	// Save the formatted userlist in the send buffer and send it back to the client
+	sprintf(stat->dataSend, "PRINT Users online: %s", msgResp);
 	printf("%s\n", stat->dataSend);
-	
 	stat->nToSend = CMD_LEN;
 	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
-		Log("temp");
 		stat->nSent = 0;
 		stat->nToSend = 0;
 		return;
 	}
-	Log("temp");
 }	
 
 void recvf(struct CONN_STAT * stat, int i) {
@@ -475,19 +622,19 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SEND:
-			msg(0, stat, i, body+1);
+			msg(SEND, stat, i, body+1);
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SEND2:
-			msg(1, stat, i, body+1);
+			msg(SEND2, stat, i, body+1);
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDA:
-			msg(2, stat, i, body+1);
+			msg(SENDA, stat, i, body+1);
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDA2:
-			msg(3, stat, i, body+1);
+			msg(SENDA2, stat, i, body+1);
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDF:
@@ -539,6 +686,7 @@ void DoServer(int svrPort) {
 		Error("Cannot listen to port %d.", svrPort);
 	}
 	
+	connID = 0;
 	nConns = 0;	
 	memset(peers, 0, sizeof(peers));	
 	peers[0].fd = listenFD;
@@ -569,6 +717,7 @@ void DoServer(int svrPort) {
 				peers[nConns].revents = 0;
 				
 				memset(&connStat[nConns], 0, sizeof(struct CONN_STAT));
+				connStat[nConns].ID = ++connID;
 			}
 		}
 		
@@ -585,7 +734,7 @@ void DoServer(int svrPort) {
 					}
 					
 					if (connStat[i].nRecv == CMD_LEN) {
-						printf("Connection %d: %s\n", i, connStat[i].dataRecv);
+						printf("Connection %d: %s", connStat[i].ID, connStat[i].dataRecv);
 						connStat[i].nCmdRecv = connStat[i].nRecv;
 						connStat[i].nRecv = 0;					
 						
@@ -598,7 +747,7 @@ void DoServer(int svrPort) {
 						// Convert the command string to its corresponding enumerated value
 						if ((connStat[i].msg = strToMsg(connStat[i].dataRecv)) == -1) {
 							Log("ERROR (conn %d): Unknown message %d", i, connStat[i].msg);
-							continue;
+							RemoveConnection(i);
 						}
 						
 						if (connStat[i].msg == RECVF) {
@@ -611,6 +760,7 @@ void DoServer(int svrPort) {
 					}
 				}
 				
+				// Act on the message received
 				if (connStat[i].nCmdRecv == CMD_LEN) {
 					protocol(&connStat[i], i, split);
 				}
@@ -637,6 +787,7 @@ int main(int argc, char * * argv) {
 		return -1;
 	}
 	
+	// grab the port number, or check if the server should reset its database
 	int port = atoi(argv[1]);
 	if (!strcmp(argv[1], "reset")) {
 		if (remove("registered_accounts.txt") == 0) {
@@ -657,5 +808,5 @@ int main(int argc, char * * argv) {
 	DoServer(port);
 	
 	// this should never be reached
-	return 0;
+	return EXIT_FAILURE;
 }

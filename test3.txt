@@ -1,0 +1,5 @@
+REGISTER peach hahaok
+DELAY 2
+LOGIN peach hahaok
+DELAY 10000
+SEND2 mario hello my name is peach.

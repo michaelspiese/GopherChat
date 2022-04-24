@@ -75,9 +75,10 @@ struct CONN_STAT {
 	char filename[33];
 	char recipient[9];
 	char dataSend[CMD_LEN];
-	char data[MAX_REQUEST_SIZE];
+	char data[CMD_LEN];
 };
 
+int eof;
 int connected;
 int timeout;
 int nConns;
@@ -178,7 +179,7 @@ void SetNonBlockIO(int fd) {
 }
 
 void RemoveConnection(int i) {
-	Log("Connection %d closed.", i);
+	//Log("Connection %d closed.", i);
 	close(peers[i].fd);	
 	if (i < nConns) {	
 		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
@@ -224,14 +225,6 @@ void createDataSocket(int type, char *cmd) {
 			
 			// Write a command consisting of the filesize to transmit and the name of the file
 			sprintf(connStat[nConns].dataSend, "RECVF %d %s", connStat[nConns].filesize, connStat[nConns].filename);
-			//if (Send_NonBlocking(fd, connStat[nConns].dataSend, CMD_LEN, &connStat[nConns], &peers[nConns]) < 0) {
-				//Error("command sent incorrectly");
-			//}
-			
-			//if (stat->nSent == CMD_LEN) {
-				//stat->nCmdSent = CMD_LEN;
-				//stat->nSent = 0;
-			//}
 		}
 	}
 }
@@ -263,6 +256,7 @@ int main(int argc, char *argv[]) {
 		Error("Client failed to connect. %s", strerror(errno));
 	}
 
+	eof = 0;
 	nConns = 0;	
 	memset(peers, 0, sizeof(peers));	
 	peers[0].fd = sock;
@@ -292,7 +286,7 @@ int main(int argc, char *argv[]) {
 			
 			memset(connStat[0].dataSend, 0, CMD_LEN);
 			if(getline(&line, &len, input) == -1) {
-				Log("EOF");
+				Log("End of script reached, disconnecting from server...");
 				break;
 			}
 			sprintf(connStat[0].dataSend, "%s", line);
@@ -323,24 +317,29 @@ int main(int argc, char *argv[]) {
 				}
 				if (connStat[i].nRecv == CMD_LEN) {
 					connStat[i].nRecv = 0;
-					Log("%s", connStat[i].data);
+					Log("%s\n", connStat[i].data);
+					if (eof) {
+						goto end;
+					}
 				}
 			}
 			
 			// Send request
 			if (peers[i].revents & POLLWRNORM) {
 				if (connStat[i].nSent < CMD_LEN && (i == 0)) {
+					//TODO WE ARE NOT GETTING HERE AFTER MULTIPLE COMMANDS WITHOUT DELAY printf("%s\n\n\n\n", connStat[i].dataSend);
 					if (Send_NonBlocking(sock, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
 						Error("command sent incorrectly");
 					}
 					
 					if (connStat[i].nSent == CMD_LEN) {
 						connStat[i].nSent = 0;	
+						peers[i].events |= POLLWRNORM;
 						
 						memset(connStat[i].dataSend, 0, CMD_LEN);
 						if(getline(&line, &len, input) == -1) {
-							Log("EOF");
-							break;
+							Log("End of script reached, disconnecting from server...");
+							eof = 1;
 						}
 						sprintf(connStat[i].dataSend, "%s", line);
 						connStat[i].msg = cmdToMsg(connStat[i].dataSend);
