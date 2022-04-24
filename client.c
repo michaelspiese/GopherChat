@@ -18,8 +18,6 @@
 #define MAX_CONCURRENCY_LIMIT 8
 
 typedef unsigned char BYTE;
-typedef unsigned int DWORD;
-typedef unsigned short WORD;
 
 // protocol messages
 typedef enum {
@@ -189,23 +187,29 @@ void RemoveConnection(int i) {
 }
 
 void createDataSocket(int type, char *cmd) {
+	// Create a non-blocking socket and connect it to the server
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	SetNonBlockIO(fd);
 	connect(fd, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
 	if (fd != -1) {
+		// If this succeeds, increase number of connections and initialize all info structs
 		++nConns;
 		peers[nConns].fd = fd;
 		peers[nConns].events = POLLWRNORM | POLLRDNORM;
 		peers[nConns].revents = 0;
 		memset(&connStat[nConns], 0, sizeof(struct CONN_STAT));
+		
+		// If command if SENDF, parse command for filename
 		if (type == SENDF) {
 			char* parse = strtok(cmd, " ");
 			parse = strtok(NULL, "");
 			sprintf(connStat[nConns].filename, "%s", parse);
+			
+			// Replace final newline with terminating null character
 			int last = strlen(connStat[nConns].filename);
 			connStat[nConns].filename[last-1] = '\0';
 			
-			// Attempt to open the file
+			// Attempt to open the file. If it doesnt exist, remove new connection
 			FILE * file;
 			if ((file = fopen(connStat[nConns].filename, "r")) == NULL) {
 				Log("ERROR: file does not exist");
@@ -218,13 +222,20 @@ void createDataSocket(int type, char *cmd) {
 			connStat[nConns].filesize = ftell(file);
 			fseek(file, 0, SEEK_SET);
 			
-			// Read the entire file into a buffer of the same size
+			// Allocate memory of the same size as the file and save the file into it
 			connStat[nConns].file = (char *)malloc(sizeof(char) * connStat[nConns].filesize);
 			memset(connStat[nConns].file, 0, connStat[nConns].filesize);
-			fread(connStat[nConns].file, sizeof(char), connStat[nConns].filesize, file);
+			
+			// Make sure the correct number of bits has been written into the buffer
+			int n;
+			if ((n = fread(connStat[nConns].file, sizeof(char), connStat[nConns].filesize, file)) != connStat[nConns].filesize) {
+				Log("ERROR: File read incorrectly (%d/%d bytes)", n, connStat[nConns].filesize);
+				RemoveConnection(nConns);
+				return;
+			}
 			
 			// Write a command consisting of the filesize to transmit and the name of the file
-			sprintf(connStat[nConns].dataSend, "RECVF %d %s", connStat[nConns].filesize, connStat[nConns].filename);
+			sprintf(connStat[nConns].dataSend, "RECVF %d %s\n", connStat[nConns].filesize, connStat[nConns].filename);
 		}
 	}
 }
@@ -256,6 +267,7 @@ int main(int argc, char *argv[]) {
 		Error("Client failed to connect. %s", strerror(errno));
 	}
 
+	// Initialize global variables and socket info structs
 	eof = 0;
 	nConns = 0;	
 	memset(peers, 0, sizeof(peers));	
@@ -272,6 +284,7 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 	
+	// Read the first line of the script and find the command type
 	if(getline(&line, &len, input) == -1) {
 		Log("initial getline failed");
 		return -1;
@@ -279,11 +292,16 @@ int main(int argc, char *argv[]) {
 	sprintf(connStat[0].dataSend, "%s", line);
 	connStat[0].msg = cmdToMsg(connStat[0].dataSend);
 	
-	while(1) {
+	// The main loop for carrying out nonblocking operations
+	while (1) {			
+		// Poll for any events happening on any open connection
 		int r = poll(peers, nConns + 1, timeout);	
+		// A timeout has occurred, a DELAY command has finished
 		if (r == 0) {
+			// Allow for writing on the socket again
 			peers[0].events |= POLLWRNORM;		
 			
+			// Grab the next line from the script and find its command type
 			memset(connStat[0].dataSend, 0, CMD_LEN);
 			if(getline(&line, &len, input) == -1) {
 				Log("End of script reached, disconnecting from server...");
@@ -292,22 +310,32 @@ int main(int argc, char *argv[]) {
 			sprintf(connStat[0].dataSend, "%s", line);
 			connStat[0].msg = cmdToMsg(connStat[0].dataSend);
 			
+			// If the next message is a SENDF or SENDF2, create a new data socket to handle transferring the file to the server
 			if (connStat[0].msg == SENDF || connStat[0].msg == SENDF2) {
 				createDataSocket(connStat[0].msg, connStat[0].dataSend);
+				
+				// Change the command sent to the server from the message socket (socket 0 on client side) to IDLE
+				memset(connStat[0].dataSend, 0, CMD_LEN);
+				sprintf(connStat[0].dataSend, "IDLE");
+				connStat[0].msg = 0;
+				continue;
 			}
 			
+			// If the next command is a DELAY, set the timeout value to whatever was requested
 			if (connStat[0].msg == DELAY) {
 				char* parse = strtok(line, " ");
 				parse = strtok(NULL, " ");
 				timeout = atoi(parse);
 			}
 			else {
+				// Otherwise change timeout to -1 to poll indefinately while not in a delay
 				timeout = -1;
 			}
 		}	
 		
+		// For all data sockets, check what event has occured and on which socket
 		for (int i=0; i<=nConns; i++) {
-			// Recv request
+			// A socket is requesting to receive data
 			if (peers[i].revents & (POLLRDNORM | POLLERR | POLLHUP)) {
 				if (Recv_NonBlocking(peers[i].fd, connStat[i].data, CMD_LEN, &connStat[i], &peers[i]) < 0) {
 					if (i == 0) {
@@ -316,6 +344,7 @@ int main(int argc, char *argv[]) {
 					RemoveConnection(i);
 				}
 				if (connStat[i].nRecv == CMD_LEN) {
+					// TODO all sockets receive commands back from the server, not messages
 					connStat[i].nRecv = 0;
 					Log("%s\n", connStat[i].data);
 					if (eof) {
@@ -324,18 +353,21 @@ int main(int argc, char *argv[]) {
 				}
 			}
 			
-			// Send request
+			// A socket is requesting to send data
 			if (peers[i].revents & POLLWRNORM) {
+				// The command socket (socket 0) will only ever send commands
 				if (connStat[i].nSent < CMD_LEN && (i == 0)) {
-					//TODO WE ARE NOT GETTING HERE AFTER MULTIPLE COMMANDS WITHOUT DELAY printf("%s\n\n\n\n", connStat[i].dataSend);
 					if (Send_NonBlocking(sock, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
-						Error("command sent incorrectly");
+						Error("Command sent incorrectly.");
 					}
 					
 					if (connStat[i].nSent == CMD_LEN) {
 						connStat[i].nSent = 0;	
+						
+						// Allow for writing again on the socket
 						peers[i].events |= POLLWRNORM;
 						
+						// Grab the next line from the script and find its command type
 						memset(connStat[i].dataSend, 0, CMD_LEN);
 						if(getline(&line, &len, input) == -1) {
 							Log("End of script reached, disconnecting from server...");
@@ -343,15 +375,19 @@ int main(int argc, char *argv[]) {
 						}
 						sprintf(connStat[i].dataSend, "%s", line);
 						connStat[i].msg = cmdToMsg(connStat[i].dataSend);
-						// Create a new data socket to service concurrent file send/receive
+						
+						// If the next message is a SENDF or SENDF2, create a new data socket to handle transferring the file to the server
 						if (connStat[i].msg == SENDF || connStat[i].msg == SENDF2) {
 							createDataSocket(connStat[i].msg, connStat[i].dataSend);
+							
+							// Change the command sent to the server from the message socket (socket 0 on client side) to IDLE
 							memset(connStat[i].dataSend, 0, CMD_LEN);
-							sprintf(connStat[i].dataSend, "IDLE ");
-							printf("%s\n", connStat[i].dataSend);
+							sprintf(connStat[i].dataSend, "IDLE");
 							connStat[i].msg = 0;
 							continue;
 						}
+						
+						// If the next message is a DELAY, set the timeout to the requested value
 						if (connStat[i].msg == DELAY) {
 							peers[i].events &= ~POLLWRNORM;
 							
@@ -360,16 +396,18 @@ int main(int argc, char *argv[]) {
 							timeout = atoi(parse);
 						}
 						else {
+							// Otherwise set timeout to -1 to poll indefinitely
 							timeout = -1;
 						}
 					}
 				}
+				
+				// The data sockets will send both a command (RECVF/RECVF2) and a file
 				else if (i > 0) {
+					// Send command
 					if (connStat[i].nStatSent < CMD_LEN) {
 						if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
-							Error("command sent incorrectly");
-							RemoveConnection(i);
-							continue;
+							Error("Command sent incorrectly.");
 						}
 						if (connStat[i].nSent == CMD_LEN) {
 							connStat[i].nStatSent = CMD_LEN;
@@ -377,6 +415,7 @@ int main(int argc, char *argv[]) {
 						}
 					}
 					
+					// Send file
 					if (connStat[i].nStatSent == CMD_LEN && connStat[i].nSent < connStat[i].filesize) {
 						if (Send_NonBlocking(peers[i].fd, connStat[i].file, connStat[i].filesize, &connStat[i], &peers[i]) < 0) {
 							Error("command sent incorrectly");

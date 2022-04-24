@@ -15,8 +15,6 @@
 #include <signal.h>
 
 typedef unsigned char BYTE;
-typedef unsigned int DWORD;
-typedef unsigned short WORD;
 
 #define MAX_REQUEST_SIZE 10000000
 #define CMD_LEN 300
@@ -45,7 +43,6 @@ struct CONN_STAT {
 	int msg;		//0 if idle/unknown
 	int nRecv;
 	int nCmdRecv;
-	int nDataRecv;
 	int nToRecv;
 	int nSent;
 	int nToSend;
@@ -60,7 +57,9 @@ struct CONN_STAT {
 
 // converting string (from script) to enumerated protocol message
 msg_type strToMsg (char *msg) {
-	if (!strcmp(msg, "REGISTER"))
+	if (!strcmp(msg, "IDLE"))
+		return IDLE;
+	else if (!strcmp(msg, "REGISTER"))
 		return REGISTER;
 	else if (!strcmp(msg, "LOGIN"))
 		return LOGIN;
@@ -203,6 +202,21 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 		}
 		
 		return;
+	}		
+	
+	// If a user tries to name themselves after an internal command send an error
+	if (strToMsg(username) != -1) {
+		sprintf(stat->dataSend, "ERROR '%s' is an invalid username because it is an internal server command. Please choose a new username.", username);
+		Log("%s", stat->dataSend);
+					
+		stat->nToSend = CMD_LEN;
+		if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
+			stat->nSent = 0;
+			stat->nToSend = 0;
+			return;
+		}
+			
+		return;
 	}
 	
 	// Open the account file and check if there is already an account with the target username
@@ -214,21 +228,6 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 		// If there is already an account with a matching name send an error
 		if (!strcmp(parse, username)) {
 			sprintf(stat->dataSend, "ERROR User already exists with username '%s'. Please choose a new username.", username);
-			Log("%s", stat->dataSend);
-					
-			stat->nToSend = CMD_LEN;
-			if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
-				stat->nSent = 0;
-				stat->nToSend = 0;
-				return;
-			}
-			
-			return;
-		}
-		
-		// If a user tries to name themselves after an internal command send an error
-		if (strToMsg(username) != -1) {
-			sprintf(stat->dataSend, "ERROR '%s' is an invalid username because it is an internal server command. Please choose a new username.", username);
 			Log("%s", stat->dataSend);
 					
 			stat->nToSend = CMD_LEN;
@@ -289,7 +288,10 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 	// Open the accounts file to check if the user exists
 	FILE *accts;
 	if((accts = fopen("registered_accounts.txt", "r")) == NULL) {
-		
+		// If the file fails to open, this almost certainly means the file hasn't been created yet
+		// This happens only when the first user to create an account chosses a prohibited username
+		Log("Failed to open registered_accounts.txt. Did the user choose a prohibited username?");
+		return;
 	}
 	
 	// Iterate through all accounts to find matching account
@@ -332,12 +334,11 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 				Log("%s", stat->dataSend);
 				break;
 			}
-			else {
-				sprintf(stat->dataSend, "ERROR Invalid user credentials.");
-				Log("%s", stat->dataSend);
-				break;
-			}
 		}
+	}
+	if (!stat->loggedIn) {
+		sprintf(stat->dataSend, "ERROR Invalid user credentials.");
+		Log("%s", stat->dataSend);
 	}
 	
 	// Close the accounts file and free the line buffer
@@ -378,10 +379,21 @@ void logout(struct CONN_STAT * stat, int i) {
 void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 	int fd = peers[i].fd;
 	
-	// Remove the newline character from teh input script if it exists for formatting purposes
+	// Remove the newline character from the input script if it exists for formatting purposes
 	int last = strlen(msg);
 	if (msg[last-1] == '\n') {
 		msg[last-1] = '\0';
+	}
+	
+	// If not logged in, then do not allow message to be sent
+	if (!stat->loggedIn) {
+		sprintf(stat->dataSend, "ERROR Cannot send message, you are not logged in.");
+		stat->nToSend = CMD_LEN;
+		if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
+			stat->nSent = 0;
+			stat->nToSend = 0;
+		}
+		return;
 	}
 	
 	// Based on the type of message, format the message and send it to the appropriate recipients (sender is included for messages)
@@ -445,7 +457,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				}
 			}
 			else {
-				sprintf(stat->dataSend, "ERROR User '%s' is not online.", target);
+				sprintf(stat->dataSend, "ERROR Cannot send, user '%s' is not online.", target);
 				stat->nToSend = CMD_LEN;
 				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
 					stat->nSent = 0;
@@ -514,7 +526,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				}
 			}
 			else {
-				sprintf(stat->dataSend, "ERROR User '%s' is not online.", target);
+				sprintf(stat->dataSend, "ERROR Cannot send, user '%s' is not online.", target);
 				stat->nToSend = CMD_LEN;
 				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
 					stat->nSent = 0;
@@ -557,18 +569,18 @@ void list(struct CONN_STAT * stat, int i) {
 }	
 
 void recvf(struct CONN_STAT * stat, int i) {
-
+	// Receive and save the file
 	if (stat->nRecv < stat->nToRecv) {
 		if (Recv_NonBlocking(peers[i].fd, stat->file, stat->nToRecv, stat, &peers[i]) < 0) {
 			RemoveConnection(i);
 			return;
 		}
-		
 		if (stat->nRecv == stat->nToRecv) {
 			stat->nRecv = 0;
 			stat->nCmdRecv = 0;
 			FILE * newFile; 
 			
+			// Open (create or replace) file with same filename on client-side
 			if ((newFile = fopen(connStat[i].filename, "w")) == NULL) {
 				Log("File cannot open");
 				RemoveConnection(i);
@@ -577,6 +589,7 @@ void recvf(struct CONN_STAT * stat, int i) {
 				Log("file '%s' opened successfully.", connStat[i].filename);
 			}
 			
+			// Write the data into the file
 			int n;
 			if ((n = fwrite(connStat[i].file, sizeof(char), connStat[i].nToRecv, newFile)) < connStat[i].nToRecv) {
 				Log("Incorrect bytes written %d/%d", n, connStat[i].nToRecv);
@@ -586,13 +599,18 @@ void recvf(struct CONN_STAT * stat, int i) {
 				Log("%d bytes written successfully to '%s'.", n, connStat[i].filename);
 			}
 			
+			// Free the allocated memory for the file and close the file pointer
 			free(connStat[i].file);
 			fclose(newFile);
+			
+			// TODO currently this terminates the connection, but we should next send a LISTEN command back to 
+			// the client in order to request a new data connection to be made for file transfer
 			RemoveConnection(i);
 		}
 	}
 }
 
+// Sends a string of text back to client. purely for debugging only
 void tempSend(struct CONN_STAT * stat, int i, char * str) {
 	sprintf(stat->dataSend, "%s", str);
 	stat->nToSend = CMD_LEN;
@@ -603,10 +621,11 @@ void tempSend(struct CONN_STAT * stat, int i, char * str) {
 	}
 }
 
+// Based on the message received from the client, do something with the data
 void protocol (struct CONN_STAT * stat, int i, char * body) {
 	switch (stat->msg) {
 		case IDLE:
-			printf("IDLE received\n");
+			printf(" (from SENDF/SENDF2)\n");
 			connStat[i].nCmdRecv = 0;
 			break;
 		case REGISTER:
@@ -656,21 +675,21 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 }
 
 void DoServer(int svrPort) {
-	BYTE * buf = (BYTE *)malloc(MAX_REQUEST_SIZE);
-	memset(buf, 0, MAX_REQUEST_SIZE);	
-	
+	// Create the nonblocking socket that listens for incoming connections
 	int listenFD = socket(AF_INET, SOCK_STREAM, 0);
 	if (listenFD < 0) {
 		Error("Cannot create listening socket.");
 	}
 	SetNonBlockIO(listenFD);
 	
+	// Set the IP Adress and Port Number of the sockets to connect to
 	struct sockaddr_in serverAddr;
 	memset(&serverAddr, 0, sizeof(struct sockaddr_in));	
 	serverAddr.sin_family = AF_INET;
 	serverAddr.sin_port = htons((unsigned short) svrPort);
 	serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+	// Set the socket options and ignore the SIGPIPE signal
 	int optval = 1;
 	int r = setsockopt(listenFD, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 	if (r != 0) {
@@ -678,14 +697,17 @@ void DoServer(int svrPort) {
 	}
 	signal(SIGPIPE, SIG_IGN);
 
+	// Bind the listening socket to the specified port number
 	if (bind(listenFD, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) != 0) {
 		Error("Cannot bind to port %d.", svrPort);
 	}
 	
+	// Listen to the listening socket for incoming connections
 	if (listen(listenFD, 16) != 0) {
 		Error("Cannot listen to port %d.", svrPort);
 	}
 	
+	// Initialize global variable values and socket info structs
 	connID = 0;
 	nConns = 0;	
 	memset(peers, 0, sizeof(peers));	
@@ -693,20 +715,18 @@ void DoServer(int svrPort) {
 	peers[0].events = POLLRDNORM;	
 	memset(connStat, 0, sizeof(connStat));
 	
-	int connID = 0;
-	while (1) {	//the main loop		
-		//monitor the listening sock and data socks, nConn+1 in total
-		int temp;
+	// The main loop for carrying out nonblocking operations
+	while (1) {			
+		// Poll for any events happening on any open connection
 		r = poll(peers, nConns + 1, -1);	
 		if (r < 0) {
 			Error("Invalid poll() return value.");
-			continue;
 		}			
-			
+		
 		struct sockaddr_in clientAddr;
 		socklen_t clientAddrLen = sizeof(clientAddr);	
 		
-		//new incoming connection
+		// A new connection is being requested, accept and initialize info structs
 		if ((peers[0].revents & POLLRDNORM) && (nConns < MAX_CONCURRENCY_LIMIT)) {					
 			int fd = accept(listenFD, (struct sockaddr *)&clientAddr, &clientAddrLen);
 			if (fd != -1) {
@@ -721,18 +741,21 @@ void DoServer(int svrPort) {
 			}
 		}
 		
+		// For all data sockets, check what event has occured and on which socket
 		for (int i=1; i<=nConns; i++) {
+			// A data socket is requesting to receive data
 			if (peers[i].revents & (POLLRDNORM | POLLERR | POLLHUP)) {
 				int fd = peers[i].fd;
 				char * split;
 				
-				// protocol message type recv request
+				// Attempting to receive a command from the client
 				if (connStat[i].nCmdRecv < CMD_LEN) {
-					if ((temp = Recv_NonBlocking(fd, (BYTE *)&connStat[i].dataRecv, CMD_LEN, &connStat[i], &peers[i])) < 0) {
+					if (Recv_NonBlocking(fd, (BYTE *)&connStat[i].dataRecv, CMD_LEN, &connStat[i], &peers[i]) < 0) {
 						RemoveConnection(i);
 						continue;
 					}
 					
+					// If full command has been received, parse it for what action to take next
 					if (connStat[i].nRecv == CMD_LEN) {
 						printf("Connection %d: %s", connStat[i].ID, connStat[i].dataRecv);
 						connStat[i].nCmdRecv = connStat[i].nRecv;
@@ -746,13 +769,22 @@ void DoServer(int svrPort) {
 		
 						// Convert the command string to its corresponding enumerated value
 						if ((connStat[i].msg = strToMsg(connStat[i].dataRecv)) == -1) {
-							Log("ERROR (conn %d): Unknown message %d", i, connStat[i].msg);
+							Log("ERROR (conn %d): Unknown message %d", connStat[i].ID, connStat[i].msg);
 							RemoveConnection(i);
 						}
 						
+						// If the received command is a file receive from the client, parse through the command to grab the filesize and filename
 						if (connStat[i].msg == RECVF) {
 							char *filesize = strtok(split+1, " ");
 							char *filename = strtok(NULL, " ");
+							
+							// Remove the final newline from the filename
+							int len = strlen(filename);
+							if (filename[len-1] == '\n') {
+								filename[len-1] = '\0';
+							}
+							
+							// Save filename and filesize and allocate memory for receiving the file
 							sprintf(connStat[i].filename, "%s", filename);
 							connStat[i].nToRecv = atoi(filesize);
 							connStat[i].file = (char *)malloc(sizeof(char) * connStat[i].nToRecv);
