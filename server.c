@@ -36,7 +36,8 @@ typedef enum {
 	SENDF2,
 	LIST,
 	DELAY,
-	RECVF
+	RECVF,
+	RECVF4
 } msg_type;
 
 struct CONN_STAT {
@@ -45,9 +46,11 @@ struct CONN_STAT {
 	int nCmdRecv;
 	int nToRecv;
 	int nSent;
+	int nCmdSent;
 	int nToSend;
 	int ID;
 	int loggedIn;
+	int isFileRequest;
 	char * file;
 	char filename[MAX_FILENAME];
 	char user[MAX_CRED];
@@ -83,6 +86,8 @@ msg_type strToMsg (char *msg) {
 		return DELAY;
 	else if (!strcmp(msg, "RECVF"))
 		return RECVF;
+	else if (!strcmp(msg, "RECVF4"))
+		return RECVF4;
 	else
 		return -1;
 }
@@ -599,14 +604,98 @@ void recvf(struct CONN_STAT * stat, int i) {
 				Log("%d bytes written successfully to '%s'.", n, connStat[i].filename);
 			}
 			
+			// flush file buffer
+			//fflush(newFile);
+			
 			// Free the allocated memory for the file and close the file pointer
 			free(connStat[i].file);
 			fclose(newFile);
 			
-			// TODO currently this terminates the connection, but we should next send a LISTEN command back to 
-			// the client in order to request a new data connection to be made for file transfer
+			// Send a LISTEN command back to the clients in order to request a new data connection to be made for file transfer
+			for (int j=1; j<=nConns; j++) {
+				connStat[j].nToSend = CMD_LEN;
+				if (connStat[j].loggedIn) {
+					// TODO remove this log
+					Log("send 2 %s", connStat[j].user);
+					sprintf(connStat[j].dataSend, "LISTEN %s", connStat[i].filename);
+					
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+						stat->nSent = 0;
+						stat->nToSend = 0;
+					}
+				}
+			}
+			
+			// After queueing messages to send to logged in clients, close this helper socket
 			RemoveConnection(i);
 		}
+	}
+}
+
+void sendf(struct CONN_STAT * stat, int i, char * filename) {
+	// Let the server know this socket will be sending a file
+	stat->isFileRequest = 1;
+	int last = strlen(filename);
+	if (filename[last-1] == '\n')
+		filename[last-1] = '\0';
+		
+	FILE * reqFile;
+	if ((reqFile = fopen(filename, "r")) == NULL) {
+		Log("file '%s' not found in server database", filename);
+		return;
+	}
+	else {
+		Log("file '%s' opened successfully", filename);
+	}
+	
+	fseek(reqFile, 0, SEEK_END);
+	stat->nToSend = ftell(reqFile);
+	fseek(reqFile, 0, SEEK_SET);
+	
+	Log("filesize %d", stat->nToSend);
+	
+	stat->file = (char *)malloc(sizeof(char) * stat->nToSend);
+	memset(stat->file, 0, stat->nToSend);
+	
+	fclose(reqFile);
+	
+	int fd = open(filename, O_RDONLY);
+	
+	//fflush(reqFile);
+	
+	int n;
+	if ((n = read(fd, stat->file, stat->nToSend)) != stat->nToSend) {
+		Log("ERROR: only read %d/%d bytes from '%s'.", n, stat->nToSend, filename);
+	}
+	else {
+		Log("Successfully read %d bytes of '%s' into the file buffer.", n, filename);
+	}
+	
+	//if ((n = fread(stat->file, sizeof(char), stat->nToRecv, reqFile)) != stat->nToSend) {
+	//	Log("ERROR: only read %d/%d bytes from '%s'.", n, stat->nToSend, filename);
+	//	//if (ferror(reqFile)) {
+	//		Log("Error %d: %s", errno, strerror(errno));
+	//		perror("fwrite");
+	//	//}
+	//}
+	//else {
+	//	Log("Successfully read %d bytes of '%s' into the file buffer.", n, filename);
+	//}
+	
+	Log("read %d", n);
+	
+	// Close the requested file as it has already been read into memory
+	//fclose(reqFile);
+	close(fd);
+	
+	// Generate the command for the client to receive the file
+	sprintf(stat->dataSend, "RECV %d %s", stat->nToSend, filename);
+	
+	// Initiate file transfer by sending the message
+	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
+		peers[i].events |= POLLWRNORM;
+		stat->nCmdSent = CMD_LEN;
+		stat->nSent = 0;
 	}
 }
 
@@ -657,13 +746,15 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			connStat[i].nCmdRecv = 0;
 			break;
 		case SENDF:
-			//sendfile(0, stat, i);
+			sendf(stat, i, body+1);
 			connStat[i].nCmdRecv = 0;
 			break;
-		case SENDF2:
-			//sendfile(1, stat, i);
-			connStat[i].nCmdRecv = 0;
-			break;
+		/* SENDF2 is an unused server command */
+		//case SENDF2:
+		//	//sendfile(1, stat, i);
+		//	connStat[i].nCmdRecv = 0;
+		//	break;
+		/* ---------------------------------- */
 		case LIST:
 			list(stat, i);
 			connStat[i].nCmdRecv = 0;
@@ -671,6 +762,12 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 		case RECVF:
 			recvf(stat, i);
 			break;
+		case RECVF4:
+			//recvf4(stat, i);
+			break;
+		default:
+			Log("!!ERROR!!: Unknown message from client. Closing connection...");
+			RemoveConnection(i);
 	}
 }
 
@@ -802,10 +899,36 @@ void DoServer(int svrPort) {
 			//a previously blocked data socket becomes writable
 			if (peers[i].revents & POLLWRNORM) {
 				//int msg = connStat[i].msg;
-				if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
-					connStat[i].nToSend = 0;
-					connStat[i].nSent = 0;
-					continue;
+				if (connStat[i].isFileRequest) {
+					if (connStat[i].nCmdSent < CMD_LEN) {
+						if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
+							Log("send error\n\n\n");
+							RemoveConnection(i);
+						}
+						if (connStat[i].nSent == CMD_LEN) {
+							connStat[i].nCmdSent = CMD_LEN;
+							connStat[i].nSent = 0;
+						}
+					}
+					if (connStat[i].nCmdSent == CMD_LEN && connStat[i].nSent < connStat[i].nToSend) {
+						if (Send_NonBlocking(peers[i].fd, connStat[i].file, connStat[i].nToSend, &connStat[i], &peers[i]) < 0) {
+							Log("send error (file)\n\n\n");
+							RemoveConnection(i);
+						}
+						if (connStat[i].nSent == CMD_LEN) {
+							Log("successfully sent %d bytes to client", connStat[i].nToSend);
+							connStat[i].nSent = 0;
+							connStat[i].nCmdSent = 0;
+							continue;
+						}
+					}
+				}
+				else {
+					if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, connStat[i].nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == connStat[i].nToSend) {
+						connStat[i].nToSend = 0;
+						connStat[i].nSent = 0;
+						continue;
+					}
 				}
 			}
 
