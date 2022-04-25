@@ -37,7 +37,8 @@ typedef enum {
 	LIST,
 	DELAY,
 	RECVF,
-	RECVF4
+	RECVF4,
+	TERMINATE
 } msg_type;
 
 struct CONN_STAT {
@@ -54,6 +55,7 @@ struct CONN_STAT {
 	char * file;
 	char filename[MAX_FILENAME];
 	char user[MAX_CRED];
+	char fileUser[MAX_CRED];
 	char dataRecv[CMD_LEN];
 	char dataSend[CMD_LEN];
 };
@@ -88,6 +90,8 @@ msg_type strToMsg (char *msg) {
 		return RECVF;
 	else if (!strcmp(msg, "RECVF4"))
 		return RECVF4;
+	else if (!strcmp(msg, "TERMINATE"))
+		return TERMINATE;
 	else
 		return -1;
 }
@@ -335,7 +339,7 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 				// Log in the user
 				strcpy(stat->user, username);
 				stat->loggedIn = 1;
-				sprintf(stat->dataSend, "PRINT Successfully logged in user '%s'.", username);
+				sprintf(stat->dataSend, "LOGIN %s", username);
 				Log("%s", stat->dataSend);
 				break;
 			}
@@ -362,8 +366,8 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 void logout(struct CONN_STAT * stat, int i) {
 	// Make sure the user is logged in first before logging them out, otherwise return an error message
 	if (stat->loggedIn) {
-		sprintf(stat->dataSend, "PRINT Logging out user '%s'. Thanks for using GopherChat!", stat->user);
-		Log("%s", stat->dataSend);
+		sprintf(stat->dataSend, "LOGOUT\n");
+		printf("%s", stat->dataSend);
 		memset(stat->user, 0, 8);
 		stat->loggedIn = 0;
 	}
@@ -442,7 +446,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				// If the user is online, send them the private message
 				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
 					userOnline = 1;
-					sprintf(connStat[j].dataSend, "PRINT [%s->%s]: %s", stat->user, connStat[j].user, sepMsg);
+					sprintf(connStat[j].dataSend, "PRINT [%s->you]: %s", stat->user, sepMsg);
 					
 					connStat[j].nToSend = CMD_LEN;
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
@@ -511,7 +515,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				// If the user is online, send them the anonymous private message
 				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
 					userOnline = 1;
-					sprintf(connStat[j].dataSend, "PRINT [******->%s]: %s", connStat[j].user, sepMsg);
+					sprintf(connStat[j].dataSend, "PRINT [******->you]: %s", sepMsg);
 					
 					connStat[j].nToSend = CMD_LEN;
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
@@ -612,11 +616,71 @@ void recvf(struct CONN_STAT * stat, int i) {
 			fclose(newFile);
 			
 			// Send a LISTEN command back to the clients in order to request a new data connection to be made for file transfer
+			// Do not send file back to sender
 			for (int j=1; j<=nConns; j++) {
 				connStat[j].nToSend = CMD_LEN;
-				if (connStat[j].loggedIn) {
+				if (connStat[j].loggedIn && strcmp(connStat[j].user, connStat[i].fileUser)) {
 					// TODO remove this log
 					Log("send 2 %s", connStat[j].user);
+					sprintf(connStat[j].dataSend, "LISTEN %s", connStat[i].filename);
+					
+					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+						stat->nSent = 0;
+						stat->nToSend = 0;
+					}
+				}
+			}
+			
+			// After queueing messages to send to logged in clients, close this helper socket
+			RemoveConnection(i);
+		}
+	}
+}
+
+void recvf4(struct CONN_STAT * stat, int i) {
+	// Receive and save the file
+	if (stat->nRecv < stat->nToRecv) {
+		if (Recv_NonBlocking(peers[i].fd, stat->file, stat->nToRecv, stat, &peers[i]) < 0) {
+			RemoveConnection(i);
+			return;
+		}
+		if (stat->nRecv == stat->nToRecv) {
+			stat->nRecv = 0;
+			stat->nCmdRecv = 0;
+			FILE * newFile; 
+			
+			// Open (create or replace) file with same filename on client-side
+			if ((newFile = fopen(connStat[i].filename, "w")) == NULL) {
+				Log("File cannot open");
+				RemoveConnection(i);
+			}
+			else {
+				Log("file '%s' opened successfully.", connStat[i].filename);
+			}
+			
+			// Write the data into the file
+			int n;
+			if ((n = fwrite(connStat[i].file, sizeof(char), connStat[i].nToRecv, newFile)) < connStat[i].nToRecv) {
+				Log("Incorrect bytes written %d/%d", n, connStat[i].nToRecv);
+				RemoveConnection(i);
+			}
+			else if (n == connStat[i].nToRecv) {
+				Log("%d bytes written successfully to '%s'.", n, connStat[i].filename);
+			}
+			
+			// flush file buffer
+			//fflush(newFile);
+			
+			// Free the allocated memory for the file and close the file pointer
+			free(connStat[i].file);
+			fclose(newFile);
+			
+			// Send a LISTEN command back to the target client only in order to request a new data connection to be made for file transfer
+			for (int j=1; j<=nConns; j++) {
+				connStat[j].nToSend = CMD_LEN;
+				if (connStat[j].loggedIn && !strcmp(connStat[j].user, connStat[i].fileUser)) {
+					// TODO remove this log
+					Log("send only 2 %s", connStat[j].user);
 					sprintf(connStat[j].dataSend, "LISTEN %s", connStat[i].filename);
 					
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
@@ -699,6 +763,27 @@ void sendf(struct CONN_STAT * stat, int i, char * filename) {
 	}
 }
 
+void termTransfer(struct CONN_STAT * stat, int i, char * user) {
+	int last = strlen(user);
+	if (user[last-1] == '\n')
+		user[last-1] = '\0';
+		
+	Log("Terminating auxilliary connection generated by %s", user);
+	RemoveConnection(i);
+	
+	for (int j=1; j<=nConns; j++) {
+		if (!strcmp(user, connStat[j].user)) {
+			sprintf(connStat[j].dataSend, "IDLE");
+			connStat[j].nToSend = CMD_LEN;
+			if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
+				connStat[j].nSent = 0;
+				connStat[j].nToSend = 0;
+				return;
+			}
+		}
+	}
+}
+
 // Sends a string of text back to client. purely for debugging only
 void tempSend(struct CONN_STAT * stat, int i, char * str) {
 	sprintf(stat->dataSend, "%s", str);
@@ -763,7 +848,12 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			recvf(stat, i);
 			break;
 		case RECVF4:
-			//recvf4(stat, i);
+			Log("receive 4: %s", body+1);
+			recvf4(stat, i);
+			break;
+		case TERMINATE:
+			termTransfer(stat, i, body+1);
+			connStat[i].nCmdRecv = 0;
 			break;
 		default:
 			Log("!!ERROR!!: Unknown message from client. Closing connection...");
@@ -866,13 +956,14 @@ void DoServer(int svrPort) {
 		
 						// Convert the command string to its corresponding enumerated value
 						if ((connStat[i].msg = strToMsg(connStat[i].dataRecv)) == -1) {
-							Log("ERROR (conn %d): Unknown message %d", connStat[i].ID, connStat[i].msg);
+							Log("ERROR (conn %d): Unknown message %s", connStat[i].ID, connStat[i].dataRecv);
 							RemoveConnection(i);
 						}
 						
-						// If the received command is a file receive from the client, parse through the command to grab the filesize and filename
+						// If the received command is a file receive from the client, parse through the command to grab the sender, filesize, and filename
 						if (connStat[i].msg == RECVF) {
-							char *filesize = strtok(split+1, " ");
+							char *user = strtok(split+1, " ");
+							char *filesize = strtok(NULL, " ");
 							char *filename = strtok(NULL, " ");
 							
 							// Remove the final newline from the filename
@@ -881,7 +972,26 @@ void DoServer(int svrPort) {
 								filename[len-1] = '\0';
 							}
 							
-							// Save filename and filesize and allocate memory for receiving the file
+							// Save user, filename, and filesize and allocate memory for receiving the file
+							sprintf(connStat[i].fileUser, "%s", user);
+							sprintf(connStat[i].filename, "%s", filename);
+							connStat[i].nToRecv = atoi(filesize);
+							connStat[i].file = (char *)malloc(sizeof(char) * connStat[i].nToRecv);
+						}
+						
+						if (connStat[i].msg == RECVF4) {
+							char *target = strtok(split+1, " ");
+							char *filesize = strtok(NULL, " ");
+							char *filename = strtok(NULL, " ");
+							
+							// Remove the final newline from the filename
+							int len = strlen(filename);
+							if (filename[len-1] == '\n') {
+								filename[len-1] = '\0';
+							}
+							
+							// Save user, filename, and filesize and allocate memory for receiving the file
+							sprintf(connStat[i].fileUser, "%s", target);
 							sprintf(connStat[i].filename, "%s", filename);
 							connStat[i].nToRecv = atoi(filesize);
 							connStat[i].file = (char *)malloc(sizeof(char) * connStat[i].nToRecv);

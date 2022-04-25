@@ -41,7 +41,9 @@ typedef enum {
 
 // converting string (from script) to enumerated protocol message
 msg_type strToMsg (char *msg) {
-	if (!strcmp(msg, "REGISTER"))
+	if (!strcmp(msg, "IDLE"))
+		return IDLE;
+	else if (!strcmp(msg, "REGISTER"))
 		return REGISTER;
 	else if (!strcmp(msg, "LOGIN"))
 		return LOGIN;
@@ -82,9 +84,10 @@ struct CONN_STAT {
 	int nSent;
 	int nStatSent;
 	int filesize;
+	int loggedIn;
 	char *file;
+	char user[8];
 	char filename[33];
-	char recipient[9];
 	char cmdSend[CMD_LEN];
 	char cmdRecv[CMD_LEN];
 };
@@ -199,11 +202,23 @@ void RemoveConnection(int i) {
 	nConns--;
 }
 
+void login(int i, char * user) {
+	sprintf(connStat[i].user, "%s", user);
+	connStat[i].loggedIn = 1;
+	Log("Successfully logged in with user '%s'.\n", connStat[i].user);
+}
+
+void logout(int i) {
+	Log("Logging out user '%s'. Thanks for using GopherChat!\n", connStat[i].user);
+	connStat[i].loggedIn = 0;
+	memset(connStat[i].user, 0, 8);
+}
+
 void createDataSocket(int type, char *cmd) {
 	// Create a non-blocking socket and connect it to the server
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	SetNonBlockIO(fd);
 	connect(fd, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
+	SetNonBlockIO(fd);
 	if (fd != -1) {
 		// If this succeeds, increase number of connections and initialize all info structs
 		++nConns;
@@ -218,7 +233,7 @@ void createDataSocket(int type, char *cmd) {
 			parse = strtok(NULL, "");
 			sprintf(connStat[nConns].filename, "%s", parse);
 			
-			// Replace final newline with terminating null character
+			// Replace final newline with terminating null character TODO check if last character is newline
 			int last = strlen(connStat[nConns].filename);
 			connStat[nConns].filename[last-1] = '\0';
 			
@@ -251,7 +266,47 @@ void createDataSocket(int type, char *cmd) {
 			fclose(file);
 			
 			// Write a command consisting of the filesize to transmit and the name of the file
-			sprintf(connStat[nConns].cmdSend, "RECVF %d %s\n", connStat[nConns].filesize, connStat[nConns].filename);
+			sprintf(connStat[nConns].cmdSend, "RECVF %s %d %s\n", connStat[0].user, connStat[nConns].filesize, connStat[nConns].filename);
+		}
+		if (type == SENDF2) {
+			char *target = strtok(cmd, " ");
+			target = strtok(NULL, " ");
+			char *filename = strtok(NULL, "");
+			sprintf(connStat[nConns].filename, "%s", filename);
+			
+			int last = strlen(connStat[nConns].filename);
+			connStat[nConns].filename[last-1] = '\0';
+			
+			// Attempt to open the file. If it doesnt exist, remove new connection
+			FILE * file;
+			if ((file = fopen(connStat[nConns].filename, "r")) == NULL) {
+				Log("ERROR: file does not exist");
+				RemoveConnection(nConns);
+				return;
+			}
+			
+			// Find the size of the file
+			fseek(file, 0, SEEK_END);
+			connStat[nConns].filesize = ftell(file);
+			fseek(file, 0, SEEK_SET);
+			
+			// Allocate memory of the same size as the file and save the file into it
+			connStat[nConns].file = (char *)malloc(sizeof(char) * connStat[nConns].filesize);
+			memset(connStat[nConns].file, 0, connStat[nConns].filesize);
+			
+			// Make sure the correct number of bits has been written into the buffer
+			int n;
+			if ((n = fread(connStat[nConns].file, sizeof(char), connStat[nConns].filesize, file)) != connStat[nConns].filesize) {
+				Log("ERROR: File read incorrectly (%d/%d bytes)", n, connStat[nConns].filesize);
+				RemoveConnection(nConns);
+				return;
+			}
+			
+			// Close the new file as it has been saved into memory
+			fclose(file);
+			
+			// Write a command consisting of the filesize to transmit and the name of the file
+			sprintf(connStat[nConns].cmdSend, "RECVF4 %s %d %s\n", target, connStat[nConns].filesize, connStat[nConns].filename);
 		}
 	}
 }
@@ -259,8 +314,8 @@ void createDataSocket(int type, char *cmd) {
 void reqSock (char * reqFile) {
 	// Create a non-blocking socket and connect it to the server
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	SetNonBlockIO(fd);
 	connect(fd, (const struct sockaddr *) &serverAddr, sizeof(serverAddr));
+	SetNonBlockIO(fd);
 	if (fd != -1) {
 		// If this succeeds, increase number of connections and initialize all info structs
 		++nConns;
@@ -278,25 +333,34 @@ void reqSock (char * reqFile) {
 }
 
 void recvf(int i) {
-	if (Recv_NonBlocking(peers[i].fd, connStat[i].file, connStat[i].filesize, &connStat[i], &peers[i]) < 0) {
-		Log("ERROR: Receive from server failed.");
-		RemoveConnection(i);
-		return;
-	}
-	if (connStat[i].nRecv == connStat[i].filesize) {
-	
-		FILE * newFile;
-		if ((newFile = fopen(connStat[i].filename, "w")) == NULL) {
-			
+	// Receive the file from the server and write it to a new file in the client directory
+	if (connStat[i].nRecv < connStat[i].filesize) {
+		if (Recv_NonBlocking(peers[i].fd, connStat[i].file, connStat[i].filesize, &connStat[i], &peers[i]) < 0) {
+			Log("ERROR: Receive from server failed.");
+			RemoveConnection(i);
+			return;
 		}
+		if (connStat[i].nRecv == connStat[i].filesize) {
+	
+			FILE * newFile;
+			if ((newFile = fopen(connStat[i].filename, "w")) == NULL) {
+			
+			}
 		
-		fwrite(connStat[i].file, sizeof(char), connStat[i].filesize, newFile);
+			fwrite(connStat[i].file, sizeof(char), connStat[i].filesize, newFile);
 		
-		fclose(newFile);
-		free(connStat[i].file);
-		connStat[i].nCmdRecv = 0;
-		connStat[i].nRecv = 0;
-		RemoveConnection(i);
+			fclose(newFile);
+			free(connStat[i].file);
+			connStat[i].nCmdRecv = 0;
+			connStat[i].nRecv = 0;
+
+			//RemoveConnection(i);
+			sprintf(connStat[i].cmdSend, "TERMINATE %s\n", connStat[0].user);
+			Log("%s", connStat[i].cmdSend);
+			if (Send_NonBlocking(peers[i].fd, connStat[i].cmdSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
+				Error("command sent incorrectly");
+			}
+		}
 	}
 }
 
@@ -306,6 +370,15 @@ void protocol(char * cmdRecv, int i) {
 	int cmd = strToMsg(command);
 	
 	switch(cmd) {
+		case IDLE:
+			Log("Idle received.\n");
+			break;
+		case LOGIN:
+			login(i, message);
+			break;
+		case LOGOUT:
+			logout(i);
+			break;
 		case PRINT:
 			// TODO remove newline?
 			Log("%s\n", message);
@@ -319,7 +392,6 @@ void protocol(char * cmdRecv, int i) {
 			reqSock(message);
 			break;
 		case RECV:
-			//Log("%s\n", message);
 			recvf(i);
 			break;
 		default:
@@ -399,8 +471,13 @@ int main(int argc, char *argv[]) {
 			
 			// If the next message is a SENDF or SENDF2, create a new data socket to handle transferring the file to the server
 			if (connStat[0].msg == SENDF || connStat[0].msg == SENDF2) {
-				createDataSocket(connStat[0].msg, connStat[0].cmdSend);
-				
+				if (connStat[0].loggedIn) {
+					createDataSocket(connStat[0].msg, connStat[0].cmdSend);
+				}
+				else {
+					Log("ERROR: Cannot send file, you are not logged in.\n");
+				}
+					
 				// Change the command sent to the server from the message socket (socket 0 on client side) to IDLE
 				memset(connStat[0].cmdSend, 0, CMD_LEN);
 				sprintf(connStat[0].cmdSend, "IDLE");
@@ -485,13 +562,18 @@ int main(int argc, char *argv[]) {
 						connStat[i].msg = cmdToMsg(connStat[i].cmdSend);
 						
 						// If the next message is a SENDF or SENDF2, create a new data socket to handle transferring the file to the server
-						if (connStat[i].msg == SENDF || connStat[i].msg == SENDF2) {
-							createDataSocket(connStat[i].msg, connStat[i].cmdSend);
-							
+						if (connStat[0].msg == SENDF || connStat[0].msg == SENDF2) {
+							if (connStat[i].loggedIn) {
+								createDataSocket(connStat[0].msg, connStat[0].cmdSend);
+							}
+							else {
+								Log("ERROR: Cannot send file, you are not logged in.\n");
+							}
+					
 							// Change the command sent to the server from the message socket (socket 0 on client side) to IDLE
-							memset(connStat[i].cmdSend, 0, CMD_LEN);
-							sprintf(connStat[i].cmdSend, "IDLE");
-							connStat[i].msg = 0;
+							memset(connStat[0].cmdSend, 0, CMD_LEN);
+							sprintf(connStat[0].cmdSend, "IDLE");
+							connStat[0].msg = 0;
 							continue;
 						}
 						
