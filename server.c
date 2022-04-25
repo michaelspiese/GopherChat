@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <poll.h>
 #include <signal.h>
+#include <time.h>
 
 typedef unsigned char BYTE;
 
@@ -56,6 +57,7 @@ struct CONN_STAT {
 	char filename[MAX_FILENAME];
 	char user[MAX_CRED];
 	char fileUser[MAX_CRED];
+	char fileRecip[MAX_CRED];
 	char dataRecv[CMD_LEN];
 	char dataSend[CMD_LEN];
 };
@@ -96,10 +98,20 @@ msg_type strToMsg (char *msg) {
 		return -1;
 }
 
+char *timestamp;
 int connID; // Running total of connection numbers
 int nConns;	//total # of data sockets
 struct pollfd peers[MAX_CONCURRENCY_LIMIT+1];	//sockets to be monitored by poll()
 struct CONN_STAT connStat[MAX_CONCURRENCY_LIMIT+1];	//app-layer stats of the sockets
+
+char * getTimestamp() {
+	time_t timeNow;
+	time(&timeNow);
+	struct tm *now = localtime(&timeNow);
+	
+	sprintf(timestamp, "[%d:%d:%d]", now->tm_hour, now->tm_min, now->tm_sec);
+	return timestamp;
+}
 
 void Error(const char * format, ...) {
 	char msg[4096];
@@ -171,7 +183,7 @@ void SetNonBlockIO(int fd) {
 }
 
 void RemoveConnection(int i) {
-	Log("Connection %d closed. (Position %d in struct array)", connStat[i].ID, i);
+	Log("%s: Connection with client (ID %d) closed.", getTimestamp(), connStat[i].ID);
 	close(peers[i].fd);	
 	if (i < nConns) {	
 		memmove(peers + i, peers + i + 1, (nConns-i) * sizeof(struct pollfd));
@@ -199,7 +211,7 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	// Checking if the username and password are valid sizes
 	if (uLen < MIN_CRED || uLen > MAX_CRED || pLen < MIN_CRED || pLen > MAX_CRED) {
 		sprintf(stat->dataSend, "ERROR Credentials are of invalid size (must be between 4 and 8 characters). Username is %d characters and password is %d characters.", uLen, pLen);
-		Log("%s", stat->dataSend);
+		Log("%s: User attempted to register accound with credentials of invalid length.", getTimestamp());
 		
 		stat->nCmdRecv = 0;
 				
@@ -214,19 +226,19 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	}		
 	
 	// If a user tries to name themselves after an internal command send an error
-	if (strToMsg(username) != -1) {
-		sprintf(stat->dataSend, "ERROR '%s' is an invalid username because it is an internal server command. Please choose a new username.", username);
-		Log("%s", stat->dataSend);
-					
-		stat->nToSend = CMD_LEN;
-		if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
-			stat->nSent = 0;
-			stat->nToSend = 0;
-			return;
-		}
-			
-		return;
-	}
+	//if (strToMsg(username) != -1) {
+	//	sprintf(stat->dataSend, "ERROR '%s' is an invalid username because it is an internal server command. Please choose a new username.", username);
+	//	//Log("%s ", getTimestamp());
+	//				
+	//	stat->nToSend = CMD_LEN;
+	//	if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
+	//		stat->nSent = 0;
+	//		stat->nToSend = 0;
+	//		return;
+	//	}
+	//		
+	//	return;
+	//}
 	
 	// Open the account file and check if there is already an account with the target username
 	FILE *accts;
@@ -237,7 +249,7 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 		// If there is already an account with a matching name send an error
 		if (!strcmp(parse, username)) {
 			sprintf(stat->dataSend, "ERROR User already exists with username '%s'. Please choose a new username.", username);
-			Log("%s", stat->dataSend);
+			Log("%s: User attempted to register an account with a username that already exists in the database.", getTimestamp());
 					
 			stat->nToSend = CMD_LEN;
 			if (Send_NonBlocking(fd, stat->dataSend, stat->nToSend, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == stat->nToSend) {
@@ -257,7 +269,7 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 	
 	// Format a success message and send it back to the client
 	sprintf(stat->dataSend, "PRINT User '%s' registered successfully.", username);
-	Log("%s", stat->dataSend);
+	Log("%s: User successfully registered an account with username '%s'.", getTimestamp(), username);
 	
 	// Initiate sending the success message back to the client
 	stat->nToSend = CMD_LEN;
@@ -270,6 +282,7 @@ void reg(struct CONN_STAT * stat, int i, char * credentials) {
 
 void login(struct CONN_STAT * stat, int i, char * credentials) {
 	int fd = peers[i].fd;
+	int logCheck = 0;
 	char *line = (char *)malloc(sizeof(char) * 18);
 	size_t len;
 	char username[8];
@@ -278,7 +291,7 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 	// Make sure the client does not attempt to log in as another user while they are already logged in
 	if (stat->loggedIn) {
 		sprintf(stat->dataSend, "ERROR You are already logged in as '%s'.", stat->user);
-		Log("%s", stat->dataSend);
+		Log("%s: User '%s' tried to log in to another account while already logged in.", getTimestamp(), stat->user);
 		
 		stat->nToSend = CMD_LEN;
 		if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
@@ -299,7 +312,7 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 	if((accts = fopen("registered_accounts.txt", "r")) == NULL) {
 		// If the file fails to open, this almost certainly means the file hasn't been created yet
 		// This happens only when the first user to create an account chosses a prohibited username
-		Log("Failed to open registered_accounts.txt. Did the user choose a prohibited username?");
+		Log("%s: Failed to open registered_accounts.txt. Did the user choose a prohibited username?", getTimestamp());
 		return;
 	}
 	
@@ -307,13 +320,12 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 	while(getline(&line, &len, accts) != -1) {
 		parse = strtok(line, " ");
 		if (!strcmp(parse, username)) {
-			int logCheck = 0;
 			// Check if user is already logged in
 			for (int j=1; j<=nConns; j++) {
 				if (!strcmp(username, connStat[j].user)) {
 					logCheck = 1;
 					sprintf(stat->dataSend, "ERROR User '%s' is already logged in.", username);
-					Log("%s", stat->dataSend);
+					Log("%s: User attempted to log in as a user that is currently logged in (%s).", getTimestamp(), username);
 					break;
 				}
 			}
@@ -340,14 +352,14 @@ void login(struct CONN_STAT * stat, int i, char * credentials) {
 				strcpy(stat->user, username);
 				stat->loggedIn = 1;
 				sprintf(stat->dataSend, "LOGIN %s", username);
-				Log("%s", stat->dataSend);
+				Log("%s: User '%s' has successfully logged in.", getTimestamp(), username);
 				break;
 			}
 		}
 	}
-	if (!stat->loggedIn) {
+	if (!stat->loggedIn && !logCheck) {
 		sprintf(stat->dataSend, "ERROR Invalid user credentials.");
-		Log("%s", stat->dataSend);
+		Log("%s: User provided invalid password for account '%s'.", getTimestamp(), username);
 	}
 	
 	// Close the accounts file and free the line buffer
@@ -367,13 +379,13 @@ void logout(struct CONN_STAT * stat, int i) {
 	// Make sure the user is logged in first before logging them out, otherwise return an error message
 	if (stat->loggedIn) {
 		sprintf(stat->dataSend, "LOGOUT\n");
-		printf("%s", stat->dataSend);
+		printf("%s: User '%s' successfully logged out.", getTimestamp(), stat->user);
 		memset(stat->user, 0, 8);
 		stat->loggedIn = 0;
 	}
 	else {
 		sprintf(stat->dataSend, "ERROR Cannot log out, you are not logged in.");
-		Log("%s", stat->dataSend);
+		Log("%s: User attempted to log out while already logged out.", getTimestamp());
 	}
 	
 	// Send the response message back to the client
@@ -397,6 +409,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 	// If not logged in, then do not allow message to be sent
 	if (!stat->loggedIn) {
 		sprintf(stat->dataSend, "ERROR Cannot send message, you are not logged in.");
+		Log("%s: User attempted to send a message while logged out.", getTimestamp());
 		stat->nToSend = CMD_LEN;
 		if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
 			stat->nSent = 0;
@@ -413,6 +426,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 			for (int j=1; j<=nConns; j++) {
 				// Send the message to all online users
 				if (connStat[j].loggedIn) {
+					Log("%s: SERVER SENDING PUBLIC MESSAGE (%s->%s) - %s", getTimestamp(), stat->user, connStat[j].user, msg);
 					strcpy(connStat[j].dataSend, msgSend);
 					
 					connStat[j].nToSend = CMD_LEN;
@@ -433,6 +447,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 			// If the user is attempting to send a private message to themselves, send an error message
 			if (!strcmp(stat->user, target)) {
 				sprintf(stat->dataSend, "ERROR You are attempting to send a private message to yourself.");
+				Log("%s: User '%s' attempted to send a private message to themselves.", getTimestamp(), stat->user);
 				stat->nToSend = CMD_LEN;
 				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
 					stat->nSent = 0;
@@ -447,7 +462,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
 					userOnline = 1;
 					sprintf(connStat[j].dataSend, "PRINT [%s->you]: %s", stat->user, sepMsg);
-					
+					Log("%s: SERVER SENDING PRIVATE MESSAGE (%s->%s) - %s", getTimestamp(), stat->user, target, sepMsg);
 					connStat[j].nToSend = CMD_LEN;
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
 						connStat[j].nSent = 0;
@@ -467,6 +482,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 			}
 			else {
 				sprintf(stat->dataSend, "ERROR Cannot send, user '%s' is not online.", target);
+				Log("%s: User '%s' tried to send a private message to a user (%s) that is not logged in.", getTimestamp(), stat->user, target);
 				stat->nToSend = CMD_LEN;
 				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
 					stat->nSent = 0;
@@ -482,7 +498,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				// Send the anonymous message to all online users
 				if (connStat[j].loggedIn) {
 					strcpy(connStat[j].dataSend, msgSend);
-					
+					Log("%s: SERVER SENDING ANONYMOUS PUBLIC MESSAGE (%s->%s) - %s", getTimestamp(), stat->user, connStat[j].user, msg);
 					connStat[j].nToSend = CMD_LEN;
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
 						connStat[j].nSent = 0;
@@ -502,6 +518,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 			// If the user is attempting to send a private message to themselves, send an error message
 			if (!strcmp(stat->user, target)) {
 				sprintf(stat->dataSend, "ERROR You are attempting to send a private message to yourself.");
+				Log("%s: User '%s' attempted to send a private message to themselves.", getTimestamp(), stat->user);
 				stat->nToSend = CMD_LEN;
 				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
 					stat->nSent = 0;
@@ -516,7 +533,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				if (connStat[j].loggedIn && !strcmp(target, connStat[j].user)) {
 					userOnline = 1;
 					sprintf(connStat[j].dataSend, "PRINT [******->you]: %s", sepMsg);
-					
+					Log("%s: SERVER sending private anonymous message from '%s' to '%s': %s", getTimestamp(), stat->user, target, sepMsg);
 					connStat[j].nToSend = CMD_LEN;
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
 						connStat[j].nSent = 0;
@@ -536,6 +553,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 			}
 			else {
 				sprintf(stat->dataSend, "ERROR Cannot send, user '%s' is not online.", target);
+				Log("%s: User '%s' tried to send a private message to a user (%s) that is not logged in.", getTimestamp(), stat->user, target);
 				stat->nToSend = CMD_LEN;
 				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
 					stat->nSent = 0;
@@ -568,7 +586,7 @@ void list(struct CONN_STAT * stat, int i) {
 	
 	// Save the formatted userlist in the send buffer and send it back to the client
 	sprintf(stat->dataSend, "PRINT Users online: %s", msgResp);
-	printf("%s\n", stat->dataSend);
+	Log("%s: User '%s' requested the list of online users. Server responding with '%s'.", getTimestamp(), stat->user, msgResp);
 	stat->nToSend = CMD_LEN;
 	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
 		stat->nSent = 0;
@@ -591,25 +609,19 @@ void recvf(struct CONN_STAT * stat, int i) {
 			
 			// Open (create or replace) file with same filename on client-side
 			if ((newFile = fopen(connStat[i].filename, "w")) == NULL) {
-				Log("File cannot open");
+				Log("%s: Server received file from user '%s' but cannot create file '%s' in directory. Closing connection.", getTimestamp(), connStat[i].fileUser, connStat[i].filename);
 				RemoveConnection(i);
-			}
-			else {
-				Log("file '%s' opened successfully.", connStat[i].filename);
+				return;
 			}
 			
 			// Write the data into the file
 			int n;
 			if ((n = fwrite(connStat[i].file, sizeof(char), connStat[i].nToRecv, newFile)) < connStat[i].nToRecv) {
-				Log("Incorrect bytes written %d/%d", n, connStat[i].nToRecv);
+				Log("%s: Incorrect number of bytes (%d/%d) written to file '%s'. Closing connection.", getTimestamp(), n, connStat[i].nToRecv, connStat[i].filename);
 				RemoveConnection(i);
+				return;
 			}
-			else if (n == connStat[i].nToRecv) {
-				Log("%d bytes written successfully to '%s'.", n, connStat[i].filename);
-			}
-			
-			// flush file buffer
-			//fflush(newFile);
+			Log("%s: SERVER received file '%s' (%d bytes) from user '%s'.", getTimestamp(), connStat[i].filename, connStat[i].nToRecv, connStat[i].fileUser);
 			
 			// Free the allocated memory for the file and close the file pointer
 			free(connStat[i].file);
@@ -620,10 +632,9 @@ void recvf(struct CONN_STAT * stat, int i) {
 			for (int j=1; j<=nConns; j++) {
 				connStat[j].nToSend = CMD_LEN;
 				if (connStat[j].loggedIn && strcmp(connStat[j].user, connStat[i].fileUser)) {
-					// TODO remove this log
-					Log("send 2 %s", connStat[j].user);
-					sprintf(connStat[j].dataSend, "LISTEN %s", connStat[i].filename);
-					
+					sprintf(connStat[j].dataSend, "LISTEN %s %s %s", connStat[i].fileUser, connStat[j].user, connStat[i].filename);
+					strcpy(connStat[j].filename, connStat[i].filename);
+					Log("%s: SERVER sending command for user '%s' to request the file '%s' from '%s'.", getTimestamp(), connStat[j].user, connStat[i].filename, connStat[i].fileUser);
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
 						stat->nSent = 0;
 						stat->nToSend = 0;
@@ -651,25 +662,18 @@ void recvf4(struct CONN_STAT * stat, int i) {
 			
 			// Open (create or replace) file with same filename on client-side
 			if ((newFile = fopen(connStat[i].filename, "w")) == NULL) {
-				Log("File cannot open");
+				Log("%s: Server received file from user '%s' but cannot create file '%s' in directory. Closing connection.", getTimestamp(), connStat[i].fileUser, connStat[i].filename);
 				RemoveConnection(i);
-			}
-			else {
-				Log("file '%s' opened successfully.", connStat[i].filename);
 			}
 			
 			// Write the data into the file
 			int n;
 			if ((n = fwrite(connStat[i].file, sizeof(char), connStat[i].nToRecv, newFile)) < connStat[i].nToRecv) {
-				Log("Incorrect bytes written %d/%d", n, connStat[i].nToRecv);
+				Log("%s: Incorrect number of bytes (%d/%d) written to file '%s'. Closing connection.", getTimestamp(), n, connStat[i].nToRecv, connStat[i].filename);
 				RemoveConnection(i);
+				return;
 			}
-			else if (n == connStat[i].nToRecv) {
-				Log("%d bytes written successfully to '%s'.", n, connStat[i].filename);
-			}
-			
-			// flush file buffer
-			//fflush(newFile);
+			Log("%s: SERVER received file '%s' (%d bytes) from user '%s'.", getTimestamp(), connStat[i].filename, connStat[i].nToRecv, connStat[i].fileUser);
 			
 			// Free the allocated memory for the file and close the file pointer
 			free(connStat[i].file);
@@ -678,11 +682,10 @@ void recvf4(struct CONN_STAT * stat, int i) {
 			// Send a LISTEN command back to the target client only in order to request a new data connection to be made for file transfer
 			for (int j=1; j<=nConns; j++) {
 				connStat[j].nToSend = CMD_LEN;
-				if (connStat[j].loggedIn && !strcmp(connStat[j].user, connStat[i].fileUser)) {
-					// TODO remove this log
-					Log("send only 2 %s", connStat[j].user);
-					sprintf(connStat[j].dataSend, "LISTEN %s", connStat[i].filename);
-					
+				if (connStat[j].loggedIn && !strcmp(connStat[j].user, connStat[i].fileRecip)) {
+					sprintf(connStat[j].dataSend, "LISTEN %s %s %s", connStat[i].fileUser, connStat[i].fileRecip, connStat[i].filename);
+					strcpy(connStat[j].filename, connStat[i].filename);
+					Log("%s: SERVER sending command for user '%s' to request the file '%s' from '%s'.", getTimestamp(), connStat[j].user, connStat[i].filename, connStat[i].fileUser);
 					if (Send_NonBlocking(peers[j].fd, connStat[j].dataSend, CMD_LEN, &connStat[j], &peers[j]) < 0 || connStat[j].nSent == CMD_LEN) {
 						stat->nSent = 0;
 						stat->nToSend = 0;
@@ -696,65 +699,57 @@ void recvf4(struct CONN_STAT * stat, int i) {
 	}
 }
 
-void sendf(struct CONN_STAT * stat, int i, char * filename) {
+void sendf(struct CONN_STAT * stat, int i, char * listen) {
 	// Let the server know this socket will be sending a file
 	stat->isFileRequest = 1;
+	
+	char *sender = strtok(listen, " ");
+	char *receiver = strtok(NULL, " ");
+	char *filename = strtok(NULL, "");
+	
+	// Remove the final newline character from the filename
 	int last = strlen(filename);
 	if (filename[last-1] == '\n')
 		filename[last-1] = '\0';
-		
+	
+	// Open the requested file to be read
 	FILE * reqFile;
 	if ((reqFile = fopen(filename, "r")) == NULL) {
-		Log("file '%s' not found in server database", filename);
+		Log("%s: File '%s' not found in server database.", getTimestamp(), filename);
+		RemoveConnection(i);
 		return;
 	}
-	else {
-		Log("file '%s' opened successfully", filename);
-	}
 	
+	// Find the filesize of the file
 	fseek(reqFile, 0, SEEK_END);
 	stat->nToSend = ftell(reqFile);
 	fseek(reqFile, 0, SEEK_SET);
 	
-	Log("filesize %d", stat->nToSend);
-	
+	// Allocate memory to store the file
 	stat->file = (char *)malloc(sizeof(char) * stat->nToSend);
 	memset(stat->file, 0, stat->nToSend);
 	
+	// Close the file and open it again at lower level to read without dealing with buffers
 	fclose(reqFile);
+	int fd;
+	if ((fd = open(filename, O_RDONLY)) == -1) {
+		Log("%s: Server cannot open file '%s'. Closing connection.", getTimestamp(), filename);
+	}
 	
-	int fd = open(filename, O_RDONLY);
-	
-	//fflush(reqFile);
-	
+	// Attempt to read in the file into the allocated memory
 	int n;
 	if ((n = read(fd, stat->file, stat->nToSend)) != stat->nToSend) {
-		Log("ERROR: only read %d/%d bytes from '%s'.", n, stat->nToSend, filename);
+		Log("%s: Incorrect number of bytes (%d/%d) read from file '%s'. Closing connection.", getTimestamp(), n, connStat[i].nToRecv, filename);
+		RemoveConnection(i);
+		return;
 	}
-	else {
-		Log("Successfully read %d bytes of '%s' into the file buffer.", n, filename);
-	}
-	
-	//if ((n = fread(stat->file, sizeof(char), stat->nToRecv, reqFile)) != stat->nToSend) {
-	//	Log("ERROR: only read %d/%d bytes from '%s'.", n, stat->nToSend, filename);
-	//	//if (ferror(reqFile)) {
-	//		Log("Error %d: %s", errno, strerror(errno));
-	//		perror("fwrite");
-	//	//}
-	//}
-	//else {
-	//	Log("Successfully read %d bytes of '%s' into the file buffer.", n, filename);
-	//}
-	
-	Log("read %d", n);
 	
 	// Close the requested file as it has already been read into memory
-	//fclose(reqFile);
 	close(fd);
 	
 	// Generate the command for the client to receive the file
 	sprintf(stat->dataSend, "RECV %d %s", stat->nToSend, filename);
-	
+	Log("%s: SERVER sending file '%s' (%d bytes) from user '%s' to user '%s'.", getTimestamp(), filename, connStat[i].nToSend, sender, receiver);
 	// Initiate file transfer by sending the message
 	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
 		peers[i].events |= POLLWRNORM;
@@ -768,9 +763,8 @@ void termTransfer(struct CONN_STAT * stat, int i, char * user) {
 	if (user[last-1] == '\n')
 		user[last-1] = '\0';
 		
-	Log("Terminating auxilliary connection generated by %s", user);
+	Log("%s: SERVER ending file transfer process for user '%s'.", getTimestamp(), user);
 	RemoveConnection(i);
-	
 	for (int j=1; j<=nConns; j++) {
 		if (!strcmp(user, connStat[j].user)) {
 			sprintf(connStat[j].dataSend, "IDLE");
@@ -784,23 +778,11 @@ void termTransfer(struct CONN_STAT * stat, int i, char * user) {
 	}
 }
 
-// Sends a string of text back to client. purely for debugging only
-void tempSend(struct CONN_STAT * stat, int i, char * str) {
-	sprintf(stat->dataSend, "%s", str);
-	stat->nToSend = CMD_LEN;
-	if (Send_NonBlocking(peers[i].fd, stat->dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0 || connStat[i].nSent == CMD_LEN) {
-		stat->nSent = 0;
-		stat->nToSend = 0;
-		return;
-	}
-}
-
 // Based on the message received from the client, do something with the data
 void protocol (struct CONN_STAT * stat, int i, char * body) {
 	switch (stat->msg) {
 		case IDLE:
-			printf(" (from SENDF/SENDF2)\n");
-			connStat[i].nCmdRecv = 0;
+			connStat[i].nCmdRecv = 0; // Intentionally do nothing
 			break;
 		case REGISTER:
 			reg(stat, i, body+1);
@@ -834,12 +816,6 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			sendf(stat, i, body+1);
 			connStat[i].nCmdRecv = 0;
 			break;
-		/* SENDF2 is an unused server command */
-		//case SENDF2:
-		//	//sendfile(1, stat, i);
-		//	connStat[i].nCmdRecv = 0;
-		//	break;
-		/* ---------------------------------- */
 		case LIST:
 			list(stat, i);
 			connStat[i].nCmdRecv = 0;
@@ -848,16 +824,15 @@ void protocol (struct CONN_STAT * stat, int i, char * body) {
 			recvf(stat, i);
 			break;
 		case RECVF4:
-			Log("receive 4: %s", body+1);
 			recvf4(stat, i);
+			connStat[i].nCmdRecv = 0;
 			break;
 		case TERMINATE:
 			termTransfer(stat, i, body+1);
 			connStat[i].nCmdRecv = 0;
 			break;
 		default:
-			Log("!!ERROR!!: Unknown message from client. Closing connection...");
-			RemoveConnection(i);
+			Log("%s: ERROR Unknown message from client!", getTimestamp());
 	}
 }
 
@@ -944,9 +919,9 @@ void DoServer(int svrPort) {
 					
 					// If full command has been received, parse it for what action to take next
 					if (connStat[i].nRecv == CMD_LEN) {
-						printf("Connection %d: %s", connStat[i].ID, connStat[i].dataRecv);
+						//printf("Connection %d: %s", connStat[i].ID, connStat[i].dataRecv);
 						connStat[i].nCmdRecv = connStat[i].nRecv;
-						connStat[i].nRecv = 0;					
+						connStat[i].nRecv = 0;
 						
 						// Insert null character to terminate string after command type
 						split = strchr(connStat[i].dataRecv, ' ');
@@ -956,7 +931,7 @@ void DoServer(int svrPort) {
 		
 						// Convert the command string to its corresponding enumerated value
 						if ((connStat[i].msg = strToMsg(connStat[i].dataRecv)) == -1) {
-							Log("ERROR (conn %d): Unknown message %s", connStat[i].ID, connStat[i].dataRecv);
+							Log("%s: ERROR (conn %d): Unknown message %s received!", getTimestamp(), connStat[i].ID, connStat[i].dataRecv);
 							RemoveConnection(i);
 						}
 						
@@ -981,6 +956,7 @@ void DoServer(int svrPort) {
 						
 						if (connStat[i].msg == RECVF4) {
 							char *target = strtok(split+1, " ");
+							char *source = strtok(NULL, " ");
 							char *filesize = strtok(NULL, " ");
 							char *filename = strtok(NULL, " ");
 							
@@ -991,7 +967,8 @@ void DoServer(int svrPort) {
 							}
 							
 							// Save user, filename, and filesize and allocate memory for receiving the file
-							sprintf(connStat[i].fileUser, "%s", target);
+							sprintf(connStat[i].fileRecip, "%s", target);
+							sprintf(connStat[i].fileUser, "%s", source);
 							sprintf(connStat[i].filename, "%s", filename);
 							connStat[i].nToRecv = atoi(filesize);
 							connStat[i].file = (char *)malloc(sizeof(char) * connStat[i].nToRecv);
@@ -999,7 +976,7 @@ void DoServer(int svrPort) {
 					}
 				}
 				
-				// Act on the message received
+				// Act on the received command
 				if (connStat[i].nCmdRecv == CMD_LEN) {
 					protocol(&connStat[i], i, split);
 				}
@@ -1008,11 +985,10 @@ void DoServer(int svrPort) {
 			
 			//a previously blocked data socket becomes writable
 			if (peers[i].revents & POLLWRNORM) {
-				//int msg = connStat[i].msg;
 				if (connStat[i].isFileRequest) {
 					if (connStat[i].nCmdSent < CMD_LEN) {
 						if (Send_NonBlocking(peers[i].fd, connStat[i].dataSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
-							Log("send error\n\n\n");
+							Log("%s: Error sending LISTEN file request command to user '%s'. Closing connection with helper.", getTimestamp(), connStat[i].user);
 							RemoveConnection(i);
 						}
 						if (connStat[i].nSent == CMD_LEN) {
@@ -1022,11 +998,11 @@ void DoServer(int svrPort) {
 					}
 					if (connStat[i].nCmdSent == CMD_LEN && connStat[i].nSent < connStat[i].nToSend) {
 						if (Send_NonBlocking(peers[i].fd, connStat[i].file, connStat[i].nToSend, &connStat[i], &peers[i]) < 0) {
-							Log("send error (file)\n\n\n");
+							Log("%s: Error sending file '%s' to user '%s'. Closing connection with helper.", getTimestamp(), connStat[i].filename, connStat[i].user);
 							RemoveConnection(i);
 						}
 						if (connStat[i].nSent == CMD_LEN) {
-							Log("successfully sent %d bytes to client", connStat[i].nToSend);
+							Log("%s: SERVER successfully sent file '%s' (%d bytes) to user '%s'", getTimestamp(), connStat[i].filename, connStat[i].nToSend, connStat[i].user);
 							connStat[i].nSent = 0;
 							connStat[i].nCmdSent = 0;
 							continue;
@@ -1052,15 +1028,18 @@ int main(int argc, char * * argv) {
 		return -1;
 	}
 	
+	// Allocating memory for timestamp generation
+	timestamp = (char *)malloc(sizeof(char) * 11);
+	
 	// grab the port number, or check if the server should reset its database
 	int port = atoi(argv[1]);
 	if (!strcmp(argv[1], "reset")) {
 		if (remove("registered_accounts.txt") == 0) {
-			Log("Resetting database.");
+			Log("%s: Resetting accounts database.", getTimestamp());
 			return 0;
 		}
 		else {
-			Log("Unable to delete account database. Is the file already deleted?");
+			Log("%s: Unable to delete account database. Is the file already deleted?", getTimestamp());
 			return -1;
 		}
 	}

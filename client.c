@@ -205,7 +205,7 @@ void RemoveConnection(int i) {
 void login(int i, char * user) {
 	sprintf(connStat[i].user, "%s", user);
 	connStat[i].loggedIn = 1;
-	Log("Successfully logged in with user '%s'.\n", connStat[i].user);
+	Log("Successfully logged in with user '%s'.", connStat[i].user);
 }
 
 void logout(int i) {
@@ -233,9 +233,11 @@ void createDataSocket(int type, char *cmd) {
 			parse = strtok(NULL, "");
 			sprintf(connStat[nConns].filename, "%s", parse);
 			
-			// Replace final newline with terminating null character TODO check if last character is newline
+			
+			// Replace final newline with terminating null character
 			int last = strlen(connStat[nConns].filename);
-			connStat[nConns].filename[last-1] = '\0';
+			if (connStat[nConns].filename[last-1] = '\n') 
+				connStat[nConns].filename[last-1] = '\0';
 			
 			// Attempt to open the file. If it doesnt exist, remove new connection
 			FILE * file;
@@ -274,13 +276,15 @@ void createDataSocket(int type, char *cmd) {
 			char *filename = strtok(NULL, "");
 			sprintf(connStat[nConns].filename, "%s", filename);
 			
+			// Replace final newline with terminating null character
 			int last = strlen(connStat[nConns].filename);
-			connStat[nConns].filename[last-1] = '\0';
+			if (connStat[nConns].filename[last-1] = '\n') 
+				connStat[nConns].filename[last-1] = '\0';
 			
 			// Attempt to open the file. If it doesnt exist, remove new connection
 			FILE * file;
 			if ((file = fopen(connStat[nConns].filename, "r")) == NULL) {
-				Log("ERROR: file does not exist");
+				Log("ERROR: Cannot open file '%s'. Does it exist?", connStat[nConns].filename);
 				RemoveConnection(nConns);
 				return;
 			}
@@ -306,7 +310,7 @@ void createDataSocket(int type, char *cmd) {
 			fclose(file);
 			
 			// Write a command consisting of the filesize to transmit and the name of the file
-			sprintf(connStat[nConns].cmdSend, "RECVF4 %s %d %s\n", target, connStat[nConns].filesize, connStat[nConns].filename);
+			sprintf(connStat[nConns].cmdSend, "RECVF4 %s %s %d %s\n", target, connStat[0].user, connStat[nConns].filesize, connStat[nConns].filename);
 		}
 	}
 }
@@ -356,7 +360,6 @@ void recvf(int i) {
 
 			//RemoveConnection(i);
 			sprintf(connStat[i].cmdSend, "TERMINATE %s\n", connStat[0].user);
-			Log("%s", connStat[i].cmdSend);
 			if (Send_NonBlocking(peers[i].fd, connStat[i].cmdSend, CMD_LEN, &connStat[i], &peers[i]) < 0) {
 				Error("command sent incorrectly");
 			}
@@ -371,7 +374,6 @@ void protocol(char * cmdRecv, int i) {
 	
 	switch(cmd) {
 		case IDLE:
-			Log("Idle received.\n");
 			break;
 		case LOGIN:
 			login(i, message);
@@ -380,15 +382,12 @@ void protocol(char * cmdRecv, int i) {
 			logout(i);
 			break;
 		case PRINT:
-			// TODO remove newline?
-			Log("%s\n", message);
+			Log("%s", message);
 			break;
 		case ERROR:
-			// TODO remove newline?
-			Log("ERROR: %s\n", message);
+			Log("ERROR: %s", message);
 			break;
 		case LISTEN:
-			Log("listen recvd, gen req for '%s'\n", message);
 			reqSock(message);
 			break;
 		case RECV:
