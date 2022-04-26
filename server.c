@@ -472,7 +472,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				}
 			}
 			else {
-				sprintf(stat->dataSend, "ERROR Cannot send, user '%s' is not online.", target);
+				sprintf(stat->dataSend, "ERROR Cannot send message, user '%s' is not online.", target);
 				Log("User '%s' tried to send a private message to a user (%s) that is not logged in.", stat->user, target);
 				stat->nToSend = CMD_LEN;
 				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
@@ -543,7 +543,7 @@ void msg(int sel, struct CONN_STAT * stat, int i, char * msg) {
 				}
 			}
 			else {
-				sprintf(stat->dataSend, "ERROR Cannot send, user '%s' is not online.", target);
+				sprintf(stat->dataSend, "ERROR Cannot send message, user '%s' is not online.", target);
 				Log("User '%s' tried to send a private message to a user (%s) that is not logged in.", stat->user, target);
 				stat->nToSend = CMD_LEN;
 				if (Send_NonBlocking(fd, stat->dataSend, CMD_LEN, stat, &peers[i]) < 0 || stat->nSent == CMD_LEN) {
@@ -692,7 +692,7 @@ void recvf4(struct CONN_STAT * stat, int i) {
 			// Send a LISTEN command back to the target client only in order to request a new data connection to be made for file transfer
 			for (int j=1; j<=nConns; j++) {
 				connStat[j].nToSend = CMD_LEN;
-				if (connStat[j].loggedIn && !strcmp(connStat[j].user, connStat[i].fileRecip)) {
+				if (connStat[j].loggedIn && !strcmp(connStat[j].user, connStat[i].fileRecip) && strcmp(connStat[j].user, connStat[i].fileUser)) {
 					sprintf(connStat[j].dataSend, "LISTEN %s %s %s", connStat[i].fileUser, connStat[i].fileRecip, connStat[i].filename);
 					strcpy(connStat[j].filename, connStat[i].filename);
 					Log("SERVER sending command for user '%s' to request the file '%s' from '%s'.", connStat[j].user, connStat[i].filename, connStat[i].fileUser);
